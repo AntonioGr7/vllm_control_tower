@@ -52,7 +52,7 @@ LOCAL = "__local__"
 
 
 class ModelItem(ListItem):
-    """A model row under a multi-model deployment."""
+    """A model row, nested under its deployment."""
 
     def __init__(self, cfg: ServeConfig, color: str, last: bool) -> None:
         super().__init__(classes="member last" if last else "member")
@@ -82,7 +82,7 @@ class ModelItem(ListItem):
 
 class DeploymentItem(ListItem):
     def __init__(self, dep: Deployment) -> None:
-        super().__init__(classes=None if dep.single else "group")
+        super().__init__(classes="group")
         self.dep = dep
         self.label = Static(self._text(State.STOPPED))
 
@@ -100,11 +100,8 @@ class DeploymentItem(ListItem):
         icon, style = STATE_STYLE[state]
         t = Text(f" {icon} ", style=style)
         t.append(self.dep.name, style="bold")
-        if self.dep.single:
-            m = self.dep.members[0]
-            t.append(f"\n   :{m.port}  {m.model.split('/')[-1]}", style="grey50")
-        else:
-            t.append(f"\n   {len(self.dep.members)} models", style="grey50")
+        n = len(self.dep.members)
+        t.append(f"\n   {n} model{'s' if n > 1 else ''}", style="grey50")
         return t
 
 
@@ -372,8 +369,6 @@ class ControlTower(App):
         for dep in cat.deployments:
             lv.append(DeploymentItem(dep))
             names.append(dep.name)
-            if dep.single:
-                continue
             for i, m in enumerate(dep.members):
                 color = MEMBER_COLORS[i % len(MEMBER_COLORS)]
                 lv.append(ModelItem(m, color, last=i == len(dep.members) - 1))
@@ -391,7 +386,7 @@ class ControlTower(App):
         self.select(names[index], force=True)
 
     def entry(self, name: str | None) -> Deployment | ServeConfig | None:
-        """The selected row: a deployment, or one model of a multi-model deployment."""
+        """The selected row: a deployment, or one of its models."""
         dep = next((d for d in self.deployments if d.name == name), None)
         return dep or next((m for m in self.servers if m.name == name), None)
 

@@ -114,11 +114,8 @@ def list_configs() -> None:
     for dep in cat.deployments:
         statuses = _statuses(dep)
         state = state_badge(deployment_state(dep, statuses))
-        if dep.single:
-            m = dep.members[0]
-            t.add_row(f"[bold]{dep.name}[/]", state, m.model, m.base_url)
-            continue
-        t.add_row(f"[bold]{dep.name}[/]", state, f"[grey62]{len(dep.members)} models[/]", "")
+        n = len(dep.members)
+        t.add_row(f"[bold]{dep.name}[/]", state, f"[grey62]{n} model{'s' if n > 1 else ''}[/]", "")
         for i, m in enumerate(dep.members):
             color = MEMBER_COLORS[i % len(MEMBER_COLORS)]
             t.add_row(

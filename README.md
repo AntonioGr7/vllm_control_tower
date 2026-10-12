@@ -35,7 +35,7 @@ uv run vct stop qwen3-0.6b       # or: vct stop --all
 
 | key | action |
 | --- | --- |
-| `↑` `↓` | select a deployment (or one model of a multi-model deployment) |
+| `↑` `↓` | select a deployment or one of its models |
 | `←` `→` / `1`–`4` | switch tab: Overview, Estimate, Monitor, Logs |
 | `s` / `enter` | serve the selection; a deployment starts its models in order |
 | `x` | stop it (asks for confirmation) |
@@ -93,7 +93,7 @@ models:
 - `vct start duo-chat-embed` starts models in the order listed. Each one starts only after the previous one passes its health check, because vLLM sizes its KV cache from the free memory it sees at startup.
 - `vct stop duo-chat-embed` stops them in reverse order.
 - `vct estimate duo-chat-embed` adds a combined check. Each vLLM instance claims `gpu-memory-utilization × total VRAM`, so models on the same GPU must sum to less than what is free, minus one CUDA context (~0.2 GiB) per model. Models with different `CUDA_VISIBLE_DEVICES` are budgeted separately.
-- One model can be targeted on its own: `vct stop duo-chat-embed.embed`, `vct logs duo-chat-embed.chat -f`. In the TUI, multi-model deployments list their models underneath. The deployment row acts on all of them, and its Monitor and Logs tabs combine them.
+- One model can be targeted on its own: `vct stop duo-chat-embed.embed`, `vct logs duo-chat-embed.chat -f`. In the TUI and `vct list`, every deployment lists its models underneath, even when there is only one. The deployment row acts on all of them, and its Monitor and Logs tabs combine them. A model row acts on that model alone.
 
 ![Deployment estimate: a chat model and an embedding model sharing one GPU, with the combined VRAM budget per model](docs/tui-group.png)
 

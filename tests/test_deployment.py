@@ -48,7 +48,7 @@ def test_deployment_loading(write_config):
     assert [d.name for d in cat.deployments] == ["duo", "solo"]
     assert [m.name for m in cat.servers] == ["duo.chat", "duo.embed", "solo.main"]
     duo, solo = cat.deployments
-    assert not duo.single and solo.single
+    assert (len(duo.members), len(solo.members)) == (2, 1)
     chat, embed = duo.members
     assert chat.deployment == "duo" and chat.short_name == "chat"
     assert duo.member("chat") is chat and duo.member("duo.embed") is embed

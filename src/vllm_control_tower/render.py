@@ -170,7 +170,7 @@ def diagnostics(est: Estimate) -> RenderableType | None:
     return Group(*lines) if lines else None
 
 
-def estimate_report(est: Estimate, title: str | None = None) -> RenderableType:
+def estimate_report(est: Estimate) -> RenderableType:
     verdict = (
         Text(" FITS ", style="bold black on green")
         if est.fits
@@ -190,7 +190,7 @@ def estimate_report(est: Estimate, title: str | None = None) -> RenderableType:
         parts += [Text(), diag]
     return Panel(
         Group(*parts),
-        title=Text.assemble(f" {title or est.config_name} ", verdict),
+        title=Text.assemble(f" {est.config_name} ", verdict),
         border_style="green" if est.fits else "red",
     )
 
@@ -218,9 +218,7 @@ def gpu_table(gpus: list[GpuSpec]) -> RenderableType:
     return t
 
 
-def config_details(
-    cfg: ServeConfig, status: Status | None = None, description: str = ""
-) -> RenderableType:
+def config_details(cfg: ServeConfig, status: Status | None = None) -> RenderableType:
     t = Table.grid(padding=(0, 2))
     t.add_column(style="grey62")
     t.add_column()
@@ -231,8 +229,8 @@ def config_details(
             if status.uptime_s is not None:
                 badge.append(f"  up {_duration(status.uptime_s)}", style="grey62")
         t.add_row("status", badge)
-    if description or cfg.description:
-        t.add_row("description", description or cfg.description)
+    if cfg.description:
+        t.add_row("description", cfg.description)
     t.add_row("model", Text(cfg.model, style="bold cyan"))
     t.add_row("endpoint", f"{cfg.base_url}/v1")
     t.add_row("file", str(cfg.path) if cfg.path else "-")
@@ -329,11 +327,6 @@ def deployment_member_table(ge: DeploymentEstimate) -> RenderableType:
 
 
 def deployment_estimate_report(de: DeploymentEstimate) -> RenderableType:
-    if len(de.members) == 1:
-        _, est = de.members[0]
-        if isinstance(est, str):
-            return Text(est, style="red")
-        return estimate_report(est, title=de.name)
     verdict = (
         Text(" FITS ", style="bold black on green")
         if de.fits
@@ -359,17 +352,18 @@ def deployment_estimate_report(de: DeploymentEstimate) -> RenderableType:
         parts += [Text(), *lines]
     summary = Panel(
         Group(*parts),
-        title=Text.assemble(f" {de.name} ({len(de.members)} models) ", verdict),
+        title=Text.assemble(f" {de.name} ({_models(len(de.members))}) ", verdict),
         border_style="green" if de.fits else "red",
     )
     details = [estimate_report(e) for _, e in de.members if isinstance(e, Estimate)]
     return Group(summary, *details)
 
 
+def _models(n: int) -> str:
+    return f"{n} model{'s' if n > 1 else ''}"
+
+
 def deployment_details(group: Deployment, statuses: dict[str, Status]) -> RenderableType:
-    if group.single:
-        m = group.members[0]
-        return config_details(m, statuses.get(m.name), group.description)
     t = Table.grid(padding=(0, 2))
     t.add_column(style="grey62")
     t.add_column()

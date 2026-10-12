@@ -137,10 +137,6 @@ class Deployment(BaseModel):
         return cls.model_validate({**data, "models": members})
 
     @property
-    def single(self) -> bool:
-        return len(self.members) == 1
-
-    @property
     def ports(self) -> list[int]:
         return [m.port for m in self.members]
 

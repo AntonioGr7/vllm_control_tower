@@ -35,7 +35,7 @@ def test_single_model_deployment_and_command(write_config, monkeypatch):
     assert cat.errors == []
     (dep,) = cat.deployments
     assert dep.name == "small"  # defaults to the file stem
-    assert dep.single
+    assert len(dep.members) == 1
     (cfg,) = dep.members
     assert cfg.name == "small.main"  # a lone model defaults to "main"
     assert cfg.short_name == "main" and cfg.deployment == "small"
