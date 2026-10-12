@@ -6,6 +6,8 @@ A terminal control panel for [vLLM](https://github.com/vllm-project/vllm).
 - Browse them in a TUI with the arrow keys; serve, stop and monitor them live.
 - Before you serve, estimate VRAM use, KV cache capacity and tokens/s on your GPU, or on any GPU from the spec table (H100, A100, L4, ...).
 
+![Estimate tab: VRAM breakdown, KV cache capacity and decode throughput for Qwen3-0.6B-FP8 on a 4 GB RTX 2050](docs/tui-estimate.png)
+
 ## Install
 
 ```bash
@@ -63,6 +65,31 @@ estimate:                      # workload assumed by the throughput estimate
   avg_prompt_tokens: 512
   avg_output_tokens: 256
 ```
+
+### Several models together (groups)
+
+A file with a `models:` list is a group: one name that starts, stops and estimates all of its members. See [configs/duo-chat-embed.yaml](configs/duo-chat-embed.yaml), which serves a chat model and an embedding model on the same 4 GB GPU.
+
+```yaml
+name: duo-chat-embed
+env: {HF_TOKEN: ${HF_TOKEN}}     # shared; each member's own env wins
+models:
+  - name: chat                    # becomes duo-chat-embed.chat
+    model: Qwen/Qwen3-0.6B-FP8
+    port: 8010
+    vllm: {args: {gpu-memory-utilization: 0.6, max-model-len: 4096}}
+  - name: embed
+    model: BAAI/bge-small-en-v1.5
+    port: 8011
+    vllm: {args: {runner: pooling, gpu-memory-utilization: 0.2, max-model-len: 512}}
+```
+
+- `vct start duo-chat-embed` starts members in the order listed. Each one starts only after the previous one passes its health check, because vLLM sizes its KV cache from the free memory it sees at startup.
+- `vct stop duo-chat-embed` stops members in reverse order.
+- `vct estimate duo-chat-embed` adds a combined check. Each vLLM instance claims `gpu-memory-utilization × total VRAM`, so members on the same GPU must sum to less than what is free. Members with different `CUDA_VISIBLE_DEVICES` are budgeted separately.
+- Members stay addressable on their own, e.g. `vct logs duo-chat-embed.chat -f`. In the TUI, the group row acts on all members, and its Monitor and Logs tabs combine them.
+
+![Group estimate: a chat model and an embedding model sharing one GPU, with the combined VRAM budget per member](docs/tui-group.png)
 
 Runtime state lives in `.vct/`: PID files, per-server logs (the previous run is kept as `.log.prev`), and cached model metadata. Override the locations with `VCT_CONFIG_DIR` and `VCT_RUNTIME_DIR`.
 

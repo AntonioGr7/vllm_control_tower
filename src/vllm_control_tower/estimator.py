@@ -12,7 +12,7 @@ numbers to be within ~20-30% of reality; benchmark before relying on them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .config import ServeConfig
 from .hardware import GiB, GpuSpec
@@ -330,6 +330,8 @@ def estimate(
     cycle = output * at_batch.step_ms / 1e3 + effective_batch * prompt / prefill_tps
     rps = effective_batch / cycle if cycle else 0.0
 
+    if str(cfg.arg("runner", "")).lower() == "pooling":
+        notes.append("pooling model: tokens/s figures assume generation; read them as prefill only")
     if gpu.source == "table":
         notes.append(f"hardware figures for {gpu.name} come from the built-in spec table")
     if model.params_source == "estimated":
@@ -382,3 +384,70 @@ def _parse_bytes(value) -> float:
     if s and s[-1] in mult:
         return float(s[:-1]) * mult[s[-1]]
     return float(s)
+
+
+def discount_running(gpu: GpuSpec, running: list[ServeConfig]) -> GpuSpec:
+    """Give back the VRAM held by configs that are already up, so they don't count as 'used by others'."""
+    if not gpu.used_bytes or not running:
+        return gpu
+    held = sum(int(gpu.memory_bytes * float(c.arg("gpu-memory-utilization", 0.9))) for c in running)
+    return replace(gpu, used_bytes=max(gpu.used_bytes - held, 0))
+
+
+@dataclass
+class GroupEstimate:
+    name: str
+    gpu: GpuSpec  # with running members' memory already discounted
+    num_gpus: int
+    members: list[tuple[ServeConfig, Estimate | str]]  # str: why the estimate failed
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def fits(self) -> bool:
+        return not self.errors and all(isinstance(e, Estimate) and e.fits for _, e in self.members)
+
+
+def device_set(cfg: ServeConfig) -> str:
+    return cfg.resolved_env().get("CUDA_VISIBLE_DEVICES", "default")
+
+
+def estimate_group(
+    name: str,
+    members: list[tuple[ServeConfig, Estimate | str]],
+    gpu: GpuSpec,
+    num_gpus: int = 1,
+) -> GroupEstimate:
+    """Check that members sharing a GPU fit together.
+
+    Every vLLM instance claims gpu-memory-utilization × total VRAM for itself and refuses
+    to start if that much isn't free, so members on the same device must sum below it.
+    """
+    ge = GroupEstimate(name, gpu, num_gpus, members)
+    by_device: dict[str, list[tuple[ServeConfig, Estimate]]] = {}
+    for cfg, est in members:
+        if isinstance(est, Estimate):
+            by_device.setdefault(device_set(cfg), []).append((cfg, est))
+    available = gpu.free_bytes if gpu.used_bytes else gpu.memory_bytes
+    for devices, items in by_device.items():
+        if len(items) < 2:
+            continue
+        where = "the same GPU" if devices == "default" else f"CUDA_VISIBLE_DEVICES={devices}"
+        total_util = sum(e.gpu_memory_utilization for _, e in items)
+        requested = sum(e.budget_bytes for _, e in items)
+        names = ", ".join(c.short_name for c, _ in items)
+        if requested > available:
+            ge.errors.append(
+                f"{names} share {where} and request {requested / GiB:.2f} GiB together "
+                f"(utilization {total_util:.2f}) but only {available / GiB:.2f} GiB is available; "
+                f"keep the sum of gpu-memory-utilization <= {available / gpu.memory_bytes - 0.01:.2f}"
+            )
+        elif total_util > 0.95:
+            ge.warnings.append(f"{names} together claim {total_util:.0%} of VRAM on {where}")
+    if len(by_device) == 1 and len(members) > 1:
+        ge.notes.append(
+            "members start one after another; each waits for the previous one to be healthy "
+            "so vLLM's memory profiling sees the right free memory"
+        )
+    return ge

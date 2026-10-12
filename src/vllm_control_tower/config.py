@@ -1,4 +1,9 @@
-"""Serving configurations: one YAML file per config inside a configs folder."""
+"""Serving configurations: YAML files inside a configs folder.
+
+A file holds either one model (a ServeConfig) or a group: a `models:` list of ServeConfigs
+that are started together, in order, and stopped together. Group members are addressed as
+`<group>.<member>`.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import os
 import re
 import shutil
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +64,11 @@ class ServeConfig(BaseModel):
 
     # Set by the loader, not part of the YAML.
     path: Path | None = Field(default=None, exclude=True)
+    group: str | None = Field(default=None, exclude=True)
+
+    @property
+    def short_name(self) -> str:
+        return self.name.removeprefix(f"{self.group}.") if self.group else self.name
 
     def arg(self, name: str, default: Any = None) -> Any:
         return self.vllm.args.get(_norm(name), default)
@@ -92,6 +103,63 @@ class ServeConfig(BaseModel):
         return cmd
 
 
+class GroupConfig(BaseModel):
+    """Several models served side by side, e.g. a chat model plus an embedding model."""
+
+    name: str
+    description: str = ""
+    # Defaults applied to every member; a member's own values win.
+    host: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    members: list[ServeConfig] = Field(default_factory=list, alias="models", min_length=1)
+
+    path: Path | None = Field(default=None, exclude=True)
+
+    @classmethod
+    def from_yaml(cls, data: dict[str, Any]) -> GroupConfig:
+        group_name = data.get("name")
+        shared_env = data.get("env") or {}
+        members = []
+        for i, raw in enumerate(data.get("models") or []):
+            if not isinstance(raw, dict):
+                raise ValueError(f"models[{i}] must be a mapping")
+            m = dict(raw)
+            m["name"] = f"{group_name}.{m.get('name', f'm{i}')}"
+            m["env"] = {**shared_env, **(m.get("env") or {})}
+            if data.get("host"):
+                m.setdefault("host", data["host"])
+            members.append(m)
+        return cls.model_validate({**data, "models": members})
+
+    @property
+    def ports(self) -> list[int]:
+        return [m.port for m in self.members]
+
+
+@dataclass
+class Catalog:
+    configs: list[ServeConfig] = field(
+        default_factory=list
+    )  # every runnable model, members included
+    groups: list[GroupConfig] = field(default_factory=list)
+    errors: list[ConfigError] = field(default_factory=list)
+
+    @property
+    def entries(self) -> list[ServeConfig | GroupConfig]:
+        """Top-level items in file order: standalone configs and groups (members follow their group)."""
+        items: list[tuple[str, ServeConfig | GroupConfig]] = [
+            (str(c.path), c) for c in self.configs if c.group is None
+        ]
+        items += [(str(g.path), g) for g in self.groups]
+        return [item for _, item in sorted(items, key=lambda t: t[0])]
+
+    def config(self, name: str) -> ServeConfig | None:
+        return next((c for c in self.configs if c.name == name), None)
+
+    def group(self, name: str) -> GroupConfig | None:
+        return next((g for g in self.groups if g.name == name), None)
+
+
 class ConfigError(Exception):
     def __init__(self, path: Path, message: str):
         super().__init__(f"{path}: {message}")
@@ -120,7 +188,7 @@ def resolve_executable(name: str) -> str:
     return shutil.which(name) or name
 
 
-def load_config(path: Path) -> ServeConfig:
+def _read_yaml(path: Path) -> dict[str, Any]:
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -128,44 +196,90 @@ def load_config(path: Path) -> ServeConfig:
     if not isinstance(data, dict):
         raise ConfigError(path, "top level must be a mapping")
     data.setdefault("name", path.stem)
+    return data
+
+
+def load_file(path: Path) -> ServeConfig | GroupConfig:
+    data = _read_yaml(path)
     try:
-        cfg = ServeConfig.model_validate(data)
-    except ValidationError as e:
+        if "models" in data:
+            item: ServeConfig | GroupConfig = GroupConfig.from_yaml(data)
+        else:
+            item = ServeConfig.model_validate(data)
+    except (ValidationError, ValueError) as e:
         raise ConfigError(path, str(e)) from e
-    cfg.path = path
-    return cfg
+    item.path = path
+    if isinstance(item, GroupConfig):
+        names = [m.name for m in item.members]
+        if len(set(names)) != len(names):
+            raise ConfigError(path, "member names must be unique within a group")
+        if len(set(item.ports)) != len(item.ports):
+            raise ConfigError(path, f"members need distinct ports, got {item.ports}")
+        for m in item.members:
+            m.path = path
+            m.group = item.name
+    return item
+
+
+def load_config(path: Path) -> ServeConfig:
+    item = load_file(path)
+    if isinstance(item, GroupConfig):
+        raise ConfigError(path, "is a group config; use load_file()")
+    return item
+
+
+def load_catalog(config_dir: Path = DEFAULT_CONFIG_DIR) -> Catalog:
+    """Load every *.yaml / *.yml in the folder. Invalid files are reported as errors."""
+    cat = Catalog()
+    if not config_dir.is_dir():
+        return cat
+    files = sorted([*config_dir.glob("*.yaml"), *config_dir.glob("*.yml")])
+    for f in files:
+        try:
+            item = load_file(f)
+        except ConfigError as e:
+            cat.errors.append(e)
+            continue
+        if isinstance(item, GroupConfig):
+            cat.groups.append(item)
+            cat.configs.extend(item.members)
+        else:
+            cat.configs.append(item)
+    seen: dict[str, Path | None] = {}
+    for name, path in [(c.name, c.path) for c in cat.configs] + [
+        (g.name, g.path) for g in cat.groups
+    ]:
+        if name in seen:
+            cat.errors.append(ConfigError(path, f"duplicate name {name!r} (also in {seen[name]})"))
+        seen[name] = path
+    return cat
 
 
 def load_configs(
     config_dir: Path = DEFAULT_CONFIG_DIR,
 ) -> tuple[list[ServeConfig], list[ConfigError]]:
-    """Load every *.yaml / *.yml in the folder. Invalid files are returned as errors."""
-    configs: list[ServeConfig] = []
-    errors: list[ConfigError] = []
-    if not config_dir.is_dir():
-        return configs, errors
-    files = sorted([*config_dir.glob("*.yaml"), *config_dir.glob("*.yml")])
-    for f in files:
-        try:
-            configs.append(load_config(f))
-        except ConfigError as e:
-            errors.append(e)
-    seen: dict[str, Path] = {}
-    for c in configs:
-        if c.name in seen:
-            errors.append(
-                ConfigError(c.path, f"duplicate name {c.name!r} (also in {seen[c.name]})")
-            )
-        seen[c.name] = c.path
-    return configs, errors
+    """Every runnable config (group members included) plus load errors."""
+    cat = load_catalog(config_dir)
+    return cat.configs, cat.errors
 
 
 def find_config(name: str, config_dir: Path = DEFAULT_CONFIG_DIR) -> ServeConfig:
-    configs, _ = load_configs(config_dir)
-    for c in configs:
-        if c.name == name:
-            return c
+    cfg = load_catalog(config_dir).config(name)
+    if cfg:
+        return cfg
     candidate = Path(name)
     if candidate.is_file():
         return load_config(candidate)
+    raise KeyError(name)
+
+
+def find_entry(name: str, config_dir: Path = DEFAULT_CONFIG_DIR) -> ServeConfig | GroupConfig:
+    """A config or a group by name (or a path to a YAML file)."""
+    cat = load_catalog(config_dir)
+    item = cat.group(name) or cat.config(name)
+    if item:
+        return item
+    candidate = Path(name)
+    if candidate.is_file():
+        return load_file(candidate)
     raise KeyError(name)

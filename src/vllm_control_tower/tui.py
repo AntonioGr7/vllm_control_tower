@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -30,23 +29,69 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from .config import ServeConfig, load_configs
-from .estimator import Estimate, estimate
+from . import ops
+from .config import GroupConfig, ServeConfig, load_catalog
+from .estimator import Estimate, GroupEstimate
 from .hardware import GiB, GpuSpec, detect_gpus, known_gpu_names, lookup
 from .metrics import MetricsTracker
-from .model_info import ModelInfoError, get_model_info
+from .model_info import ModelInfoError
 from .process import ProcessManager, State, Status
-from .render import STATE_STYLE, bar, config_details, estimate_report
+from .render import (
+    MEMBER_COLORS,
+    STATE_STYLE,
+    bar,
+    config_details,
+    estimate_report,
+    group_details,
+    group_estimate_report,
+    group_state,
+)
 
 TABS = ["overview", "estimate", "monitor", "logs"]
 LOCAL = "__local__"
 
 
 class ConfigItem(ListItem):
-    def __init__(self, cfg: ServeConfig) -> None:
-        super().__init__()
+    def __init__(self, cfg: ServeConfig, color: str | None = None) -> None:
+        super().__init__(classes="member" if cfg.group else None)
         self.cfg = cfg
+        self.color = color
         self.label = Static(self._text(State.STOPPED))
+
+    @property
+    def entry_name(self) -> str:
+        return self.cfg.name
+
+    def compose(self) -> ComposeResult:
+        yield self.label
+
+    def set_state(self, state: State) -> None:
+        self.label.update(self._text(state))
+
+    def _text(self, state: State) -> Text:
+        icon, style = STATE_STYLE[state]
+        if self.cfg.group:
+            t = Text("  ")
+            t.append("■ ", style=self.color or "grey50")
+            t.append(f"{icon} ", style=style)
+            t.append(self.cfg.short_name, style="bold")
+            t.append(f"\n      :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
+            return t
+        t = Text(f" {icon} ", style=style)
+        t.append(self.cfg.name, style="bold")
+        t.append(f"\n   :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
+        return t
+
+
+class GroupItem(ListItem):
+    def __init__(self, group: GroupConfig) -> None:
+        super().__init__(classes="group")
+        self.group = group
+        self.label = Static(self._text(State.STOPPED))
+
+    @property
+    def entry_name(self) -> str:
+        return self.group.name
 
     def compose(self) -> ComposeResult:
         yield self.label
@@ -57,8 +102,8 @@ class ConfigItem(ListItem):
     def _text(self, state: State) -> Text:
         icon, style = STATE_STYLE[state]
         t = Text(f" {icon} ", style=style)
-        t.append(self.cfg.name, style="bold")
-        t.append(f"\n   :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
+        t.append(self.group.name, style="bold")
+        t.append(f"\n   group · {len(self.group.members)} models", style="grey50")
         return t
 
 
@@ -207,6 +252,9 @@ class ControlTower(App):
     .section-title { color: $text-muted; text-style: bold; padding: 1 1 0 1; }
     #configs { height: 1fr; background: $surface; }
     #configs > ListItem { padding: 0 0 1 0; }
+    #configs > ListItem.group { padding: 0; }
+    #configs > ListItem.member { padding: 0; }
+    #configs > ListItem.member.last { padding: 0 0 1 0; }
     #gpu-panel { height: auto; max-height: 12; padding: 0 1 1 1; }
     #main { width: 1fr; }
     TabPane { padding: 0 1; }
@@ -246,17 +294,20 @@ class ControlTower(App):
         self.config_dir = config_dir
         self.runtime_dir = runtime_dir
         self.pm = ProcessManager(runtime_dir)
-        self.configs: list[ServeConfig] = []
+        self.configs: list[ServeConfig] = []  # every runnable model, group members included
+        self.groups: list[GroupConfig] = []
+        self._group_jobs: dict[str, bool] = {}  # group name -> abort requested
         self.config_errors: list[str] = []
         self.selected: str | None = None
         self.statuses: dict[str, Status] = {}
         self.trackers: dict[str, MetricsTracker] = {}
-        self.estimates: dict[tuple[str, str], Estimate | str] = {}
+        self.estimates: dict[tuple[str, str], Estimate | GroupEstimate | str] = {}
         self.hardware = LOCAL
         self.local_gpus: list[GpuSpec] = []
         self.gpu_util: deque[float] = deque(maxlen=120)
         self.gpu_mem: deque[float] = deque(maxlen=120)
-        self._log_offset: tuple[str | None, int] = (None, 0)
+        self._log_key: str | None = None
+        self._log_offsets: dict[str, int] = {}
         self._http = httpx.Client(timeout=2.0)
 
     # ---- layout -----------------------------------------------------------
@@ -310,46 +361,58 @@ class ControlTower(App):
     # ---- data loading -------------------------------------------------------
 
     def load(self) -> None:
-        configs, errors = load_configs(self.config_dir)
-        self.configs = configs
-        self.config_errors = [str(e) for e in errors]
+        cat = load_catalog(self.config_dir)
+        self.configs = cat.configs
+        self.groups = cat.groups
+        self.config_errors = [str(e) for e in cat.errors]
         lv = self.query_one("#configs", ListView)
         lv.clear()
-        for cfg in configs:
-            item = ConfigItem(cfg)
-            lv.append(item)
-            st = self.statuses.get(cfg.name)
-            if st:
-                item.set_state(st.state)
+        names: list[str] = []
+        for entry in cat.entries:
+            if isinstance(entry, GroupConfig):
+                lv.append(GroupItem(entry))
+                names.append(entry.name)
+                for i, m in enumerate(entry.members):
+                    item = ConfigItem(m, MEMBER_COLORS[i % len(MEMBER_COLORS)])
+                    if i == len(entry.members) - 1:
+                        item.add_class("last")
+                    lv.append(item)
+                    names.append(m.name)
+            else:
+                lv.append(ConfigItem(entry))
+                names.append(entry.name)
+        self.refresh_states()
         for err in self.config_errors:
             self.notify(err, title="Invalid config", severity="error", timeout=10)
-        if not configs:
+        if not names:
             self.query_one("#overview-body", Static).update(
                 Text(f"No YAML configs found in {self.config_dir.resolve()}/", style="yellow")
             )
             return
-        names = [c.name for c in configs]
         index = names.index(self.selected) if self.selected in names else 0
         lv.index = index
-        self.select(names[index])
+        self.select(names[index], force=True)
 
     def config(self, name: str | None) -> ServeConfig | None:
         return next((c for c in self.configs if c.name == name), None)
 
-    def select(self, name: str) -> None:
-        if name == self.selected and self._log_offset[0] == name:
+    def entry(self, name: str | None) -> ServeConfig | GroupConfig | None:
+        return next((g for g in self.groups if g.name == name), None) or self.config(name)
+
+    def select(self, name: str, force: bool = False) -> None:
+        if name == self.selected and not force:
             return
         self.selected = name
         self.render_overview()
         self.render_estimate()
         self.render_monitor()
-        self._log_offset = (None, 0)
+        self._log_key = None
         self.refresh_logs()
 
     @on(ListView.Highlighted, "#configs")
     def _highlighted(self, event: ListView.Highlighted) -> None:
-        if isinstance(event.item, ConfigItem):
-            self.select(event.item.cfg.name)
+        if isinstance(event.item, (ConfigItem, GroupItem)):
+            self.select(event.item.entry_name)
 
     @on(ListView.Selected, "#configs")
     def _selected(self, event: ListView.Selected) -> None:
@@ -358,56 +421,52 @@ class ControlTower(App):
     # ---- rendering ----------------------------------------------------------
 
     def render_overview(self) -> None:
-        cfg = self.config(self.selected)
-        if cfg:
-            self.query_one("#overview-body", Static).update(
-                config_details(cfg, self.statuses.get(cfg.name))
-            )
+        entry = self.entry(self.selected)
+        body = self.query_one("#overview-body", Static)
+        if isinstance(entry, GroupConfig):
+            body.update(group_details(entry, self.statuses))
+        elif entry:
+            body.update(config_details(entry, self.statuses.get(entry.name)))
 
     def hardware_label(self) -> str:
         return "local GPU" if self.hardware == LOCAL else self.hardware
 
     def render_estimate(self) -> None:
-        cfg = self.config(self.selected)
-        if not cfg:
+        entry = self.entry(self.selected)
+        if not entry:
             return
         body = self.query_one("#estimate-body", Static)
-        key = (cfg.name, self.hardware)
+        key = (entry.name, self.hardware)
         result = self.estimates.get(key)
         hint = Text(
             f"Estimating for {self.hardware_label()} · press h to change hardware", style="grey50"
         )
         if result is None:
             body.update(
-                Group(hint, Text(), Text(f"Computing estimate for {cfg.model}…", style="italic"))
+                Group(hint, Text(), Text(f"Computing estimate for {entry.name}…", style="italic"))
             )
-            self.compute_estimate(cfg, self.hardware)
+            self.compute_estimate(entry, self.hardware)
         elif isinstance(result, str):
             body.update(Group(hint, Text(), Text(result, style="red")))
+        elif isinstance(result, GroupEstimate):
+            body.update(Group(hint, group_estimate_report(result)))
         else:
             body.update(Group(hint, estimate_report(result)))
 
     @work(thread=True, group="estimate")
-    def compute_estimate(self, cfg: ServeConfig, hardware: str) -> None:
-        key = (cfg.name, hardware)
+    def compute_estimate(self, entry: ServeConfig | GroupConfig, hardware: str) -> None:
+        key = (entry.name, hardware)
         try:
-            info = get_model_info(cfg.model, runtime_dir=self.runtime_dir)
-            shards = int(cfg.arg("tensor-parallel-size", 1)) * int(
-                cfg.arg("pipeline-parallel-size", 1)
+            result: Estimate | GroupEstimate | str = ops.estimate_entry(
+                entry,
+                self.pm,
+                runtime_dir=self.runtime_dir,
+                gpu=None if hardware == LOCAL else hardware,
             )
-            if hardware == LOCAL:
-                gpus = detect_gpus()
-                if not gpus:
-                    raise RuntimeError(
-                        "No local GPU detected; press h to pick one from the spec table."
-                    )
-                tightest = min(gpus, key=lambda g: g.free_bytes)
-                spec, n = replace(tightest, name=gpus[0].name), len(gpus)
-            else:
-                spec, n = lookup(hardware), shards
-            result: Estimate | str = estimate(cfg, info, spec, n)
         except (ModelInfoError, RuntimeError, ValueError) as e:
             result = str(e)
+            if hardware == LOCAL and "no local" in result:
+                result += " (press h)"
         self.estimates[key] = result
         self.call_from_thread(self._estimate_ready, key)
 
@@ -416,41 +475,64 @@ class ControlTower(App):
             self.render_estimate()
 
     def render_monitor(self) -> None:
-        cfg = self.config(self.selected)
-        if not cfg:
+        entry = self.entry(self.selected)
+        if not entry:
             return
-        st = self.statuses.get(cfg.name)
-        tracker = self.trackers.get(cfg.name)
+        members = ops.members(entry)
+        trackers = [t for m in members if (t := self.trackers.get(m.name))]
         status = self.query_one("#monitor-status", Static)
-        if not st or st.state in (State.STOPPED, State.STALE):
-            status.update(Text(f"{cfg.name} is not running. Press s to serve it.", style="grey50"))
-        elif tracker and tracker.error and st.state is not State.RUNNING:
-            status.update(
-                Text(f"{cfg.name} is starting… waiting for {cfg.base_url}/metrics", style="yellow")
-            )
-        elif tracker and tracker.error:
-            status.update(Text(f"metrics unavailable: {tracker.error}", style="red"))
+        if isinstance(entry, GroupConfig):
+            line = Text("Summed over members: ", style="grey62")
+            for i, m in enumerate(members):
+                st = self.statuses.get(m.name)
+                icon, style = STATE_STYLE[st.state if st else State.STOPPED]
+                line.append("■ ", style=MEMBER_COLORS[i % len(MEMBER_COLORS)])
+                line.append(f"{m.short_name} ", style="bold")
+                line.append(f"{icon}   ", style=style)
+            status.update(line)
         else:
-            status.update(Text(f"Live metrics from {cfg.base_url}/metrics", style="green"))
-
-        last = tracker.snapshots[-1] if tracker and tracker.snapshots else None
-        self.query_one("#m-gen", MetricCard).push(
-            tracker.series("gen_tps") if tracker else [], last.gen_tps if last else None
-        )
-        self.query_one("#m-prompt", MetricCard).push(
-            tracker.series("prompt_tps") if tracker else [], last.prompt_tps if last else None
-        )
-        self.query_one("#m-kv", MetricCard).push(
-            [v * 100 for v in tracker.series("kv_usage")] if tracker else [],
-            last.kv_usage if last else None,
-        )
-        reqs = self.query_one("#m-reqs", MetricCard)
-        reqs.push(tracker.series("running") if tracker else [], None)
-        if last:
-            reqs.query_one(".card-value", Static).update(
-                Text(
-                    f"{last.running:.0f} running / {last.waiting:.0f} waiting", style="bold #af87ff"
+            cfg = entry
+            st = self.statuses.get(cfg.name)
+            tracker = self.trackers.get(cfg.name)
+            if not st or st.state in (State.STOPPED, State.STALE):
+                status.update(
+                    Text(f"{cfg.name} is not running. Press s to serve it.", style="grey50")
                 )
+            elif tracker and tracker.error and st.state is not State.RUNNING:
+                status.update(
+                    Text(
+                        f"{cfg.name} is starting… waiting for {cfg.base_url}/metrics",
+                        style="yellow",
+                    )
+                )
+            elif tracker and tracker.error:
+                status.update(Text(f"metrics unavailable: {tracker.error}", style="red"))
+            else:
+                status.update(Text(f"Live metrics from {cfg.base_url}/metrics", style="green"))
+
+        def combined(attr: str, how=sum) -> list[float]:
+            series = [t.series(attr) for t in trackers if t.snapshots]
+            if not series:
+                return []
+            n = max(len(x) for x in series)
+            padded = [[0.0] * (n - len(x)) + x for x in series]
+            return [how(col) for col in zip(*padded, strict=True)]
+
+        def latest(values: list[float]) -> float | None:
+            return values[-1] if values else None
+
+        gen, prompt = combined("gen_tps"), combined("prompt_tps")
+        kv = combined("kv_usage", max)  # the fullest member is the one that will queue first
+        running, waiting = combined("running"), combined("waiting")
+        self.query_one("#m-gen", MetricCard).push(gen, latest(gen))
+        self.query_one("#m-prompt", MetricCard).push(prompt, latest(prompt))
+        kv_card = self.query_one("#m-kv", MetricCard)
+        kv_card.push([v * 100 for v in kv], latest(kv))
+        reqs = self.query_one("#m-reqs", MetricCard)
+        reqs.push(running, None)
+        if running:
+            reqs.query_one(".card-value", Static).update(
+                Text(f"{running[-1]:.0f} running / {waiting[-1]:.0f} waiting", style="bold #af87ff")
             )
         self.query_one("#m-gpu", MetricCard).push(
             list(self.gpu_util), self.gpu_util[-1] if self.gpu_util else None
@@ -526,46 +608,72 @@ class ControlTower(App):
         if gpus:
             self.gpu_util.append(float(sum(g.utilization or 0 for g in gpus) / len(gpus)))
             self.gpu_mem.append(sum(g.used_bytes for g in gpus) / GiB)
-        for item in self.query_one("#configs", ListView).query(ConfigItem):
-            st = statuses.get(item.cfg.name)
-            item.set_state(st.state if st else State.STOPPED)
-        if self.selected in changed:
-            self.render_overview()
+        self.refresh_states()
+        if changed:
+            # Running servers change what "free VRAM" means for local estimates.
+            for key in [k for k in self.estimates if k[1] == LOCAL]:
+                del self.estimates[key]
+            entry = self.entry(self.selected)
+            if entry and any(m.name in changed for m in ops.members(entry)):
+                self.render_overview()
+                self.render_estimate()
         self.render_monitor()
         self.render_gpus()
 
+    def refresh_states(self) -> None:
+        lv = self.query_one("#configs", ListView)
+        for item in lv.query(ConfigItem):
+            st = self.statuses.get(item.cfg.name)
+            item.set_state(st.state if st else State.STOPPED)
+        for item in lv.query(GroupItem):
+            item.set_state(group_state(item.group, self.statuses))
+
     def refresh_logs(self) -> None:
-        name = self.selected
+        entry = self.entry(self.selected)
+        if not entry:
+            return
         log = self.query_one("#log-view", RichLog)
-        if not name:
-            return
-        path = self.pm.log_file(name)
-        current, offset = self._log_offset
-        if current != name:
+        members = ops.members(entry)
+        is_group = isinstance(entry, GroupConfig)
+
+        def prefix(i: int, m: ServeConfig) -> Text:
+            if not is_group:
+                return Text()
+            # Style only the span: a base style on the Text would bleed into the appended line.
+            return Text.assemble((f"[{m.short_name}] ", MEMBER_COLORS[i % len(MEMBER_COLORS)]))
+
+        if self._log_key != entry.name:
+            self._log_key = entry.name
+            self._log_offsets = {}
             log.clear()
+            for i, m in enumerate(members):
+                path = self.pm.log_file(m.name)
+                if not path.exists():
+                    log.write(Text(f"No logs yet for {m.name}.", style="grey50"))
+                    self._log_offsets[m.name] = 0
+                    continue
+                for line in self.pm.tail(m.name, 500 // len(members)):
+                    log.write(prefix(i, m) + Text(line))
+                self._log_offsets[m.name] = path.stat().st_size
+            return
+
+        for i, m in enumerate(members):
+            path = self.pm.log_file(m.name)
             if not path.exists():
-                log.write(Text(f"No logs yet for {name}.", style="grey50"))
-                self._log_offset = (name, 0)
-                return
-            for line in self.pm.tail(name, 500):
-                log.write(line)
-            self._log_offset = (name, path.stat().st_size)
-            return
-        if not path.exists():
-            return
-        size = path.stat().st_size
-        if size < offset:  # rotated by a restart
-            self._log_offset = (None, 0)
-            self.refresh_logs()
-            return
-        if size == offset:
-            return
-        with path.open("rb") as f:
-            f.seek(offset)
-            chunk = f.read(size - offset).decode(errors="replace")
-        for line in chunk.splitlines():
-            log.write(line)
-        self._log_offset = (name, size)
+                continue
+            size = path.stat().st_size
+            offset = self._log_offsets.get(m.name, 0)
+            if size < offset:  # rotated by a restart
+                offset = 0
+                log.write(Text(f"── {m.name} restarted ──", style="grey50"))
+            if size == offset:
+                continue
+            with path.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read(size - offset).decode(errors="replace")
+            for line in chunk.splitlines():
+                log.write(prefix(i, m) + Text(line))
+            self._log_offsets[m.name] = size
 
     # ---- actions ------------------------------------------------------------
 
@@ -578,9 +686,8 @@ class ControlTower(App):
 
     def action_reload(self) -> None:
         self.estimates.clear()
-        self._log_offset = (None, 0)
         self.load()
-        self.notify(f"Loaded {len(self.configs)} configs")
+        self.notify(f"Loaded {len(self.configs)} models ({len(self.groups)} groups)")
 
     def action_hardware(self) -> None:
         def chosen(value: str | None) -> None:
@@ -592,7 +699,11 @@ class ControlTower(App):
         self.push_screen(HardwareScreen(detect_gpus(), self.hardware), chosen)
 
     def action_start(self) -> None:
-        cfg = self.config(self.selected)
+        entry = self.entry(self.selected)
+        if isinstance(entry, GroupConfig):
+            self.start_group_action(entry)
+            return
+        cfg = entry
         if not cfg:
             return
         st = self.statuses.get(cfg.name)
@@ -606,32 +717,85 @@ class ControlTower(App):
             return
         self.notify(f"pid {rec.pid} · loading {cfg.model}", title=f"Starting {cfg.name}")
         self.statuses[cfg.name] = Status(cfg.name, State.STARTING, rec)
-        self._log_offset = (None, 0)
+        self._log_key = None
         self.action_show_tab("logs")
         self.poll()
 
+    def start_group_action(self, group: GroupConfig) -> None:
+        if group.name in self._group_jobs:
+            self.notify(f"{group.name} is already starting", severity="warning")
+            return
+        if all(ops.is_up(self.pm, m.name) for m in group.members):
+            self.notify(f"{group.name} is already running", severity="warning")
+            return
+        self._group_jobs[group.name] = False
+        self.notify(
+            " → ".join(m.short_name for m in group.members), title=f"Starting group {group.name}"
+        )
+        self._log_key = None
+        self.action_show_tab("logs")
+        self.run_group(group)
+
+    @work(thread=True)
+    def run_group(self, group: GroupConfig) -> None:
+        def event(name: str, msg: str) -> None:
+            error = msg.startswith("error")
+            self.call_from_thread(
+                self.notify,
+                msg.removeprefix("error: "),
+                title=name,
+                severity="error" if error else "information",
+                timeout=10 if error else 4,
+            )
+            self.call_from_thread(self.poll)
+
+        try:
+            ok = ops.start_group(
+                self.pm,
+                group,
+                on_event=event,
+                should_stop=lambda: self._group_jobs.get(group.name, True),
+            )
+        finally:
+            aborted = self._group_jobs.pop(group.name, False)
+        if ok:
+            self.call_from_thread(self.notify, "all members healthy", title=f"{group.name} ready")
+        elif not aborted:
+            self.call_from_thread(
+                self.notify,
+                "stopped at the failing member; press x to stop the rest",
+                title=f"{group.name} incomplete",
+                severity="warning",
+                timeout=10,
+            )
+
     def action_stop(self) -> None:
-        cfg = self.config(self.selected)
-        if not cfg:
+        entry = self.entry(self.selected)
+        if not entry:
             return
-        st = self.statuses.get(cfg.name)
-        if not st or st.state is State.STOPPED:
-            self.notify(f"{cfg.name} is not running", severity="warning")
+        up = [m for m in ops.members(entry) if ops.is_up(self.pm, m.name)]
+        if not up and entry.name not in self._group_jobs:
+            self.notify(f"{entry.name} is not running", severity="warning")
             return
+        if isinstance(entry, GroupConfig):
+            detail = "\n".join(f"{m.short_name}: {m.model} on :{m.port}" for m in up)
+            message = f"Stop group {entry.name}?\n\n{detail}"
+        else:
+            message = f"Stop {entry.name}?\n\n{entry.model} on :{entry.port}"
 
         def confirmed(ok: bool | None) -> None:
             if ok:
-                self.stop_server(cfg.name)
+                if entry.name in self._group_jobs:
+                    self._group_jobs[entry.name] = True  # abort a group start in progress
+                self.stop_servers(entry)
 
-        self.push_screen(
-            ConfirmScreen(f"Stop {cfg.name}?\n\n{cfg.model} on :{cfg.port}"), confirmed
-        )
+        self.push_screen(ConfirmScreen(message), confirmed)
 
     @work(thread=True)
-    def stop_server(self, name: str) -> None:
-        self.call_from_thread(self.notify, f"Sending SIGTERM to {name}…", title="Stopping")
-        was = self.pm.stop(name)
-        self.call_from_thread(
-            self.notify, f"{name} stopped" if was else f"{name} was not running", title="Stopped"
-        )
+    def stop_servers(self, entry: ServeConfig | GroupConfig) -> None:
+        self.call_from_thread(self.notify, f"Sending SIGTERM to {entry.name}…", title="Stopping")
+        results = ops.stop_entry(self.pm, entry)
+        stopped = [n for n, was in results if was]
+        msg = f"stopped {', '.join(stopped)}" if stopped else f"{entry.name} was not running"
+        self.call_from_thread(self.notify, msg, title="Stopped")
         self.call_from_thread(self.poll)

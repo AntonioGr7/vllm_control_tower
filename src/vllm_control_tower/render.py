@@ -7,8 +7,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .config import ServeConfig
-from .estimator import Estimate
+from .config import GroupConfig, ServeConfig
+from .estimator import Estimate, GroupEstimate, device_set
 from .hardware import GiB, GpuSpec
 from .process import State, Status
 
@@ -18,6 +18,7 @@ STATE_STYLE = {
     State.UNHEALTHY: ("●", "bold red"),
     State.STALE: ("✕", "red"),
     State.STOPPED: ("○", "grey50"),
+    State.PARTIAL: ("◑", "bold dark_orange"),
 }
 
 
@@ -248,3 +249,150 @@ def _duration(s: float) -> str:
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
+
+
+MEMBER_COLORS = [
+    "dodger_blue1",
+    "orange1",
+    "spring_green2",
+    "medium_purple1",
+    "deep_pink2",
+    "gold1",
+]
+
+
+def group_memory_bar(ge: GroupEstimate, width: int = 60) -> RenderableType:
+    """One stacked bar per device set: each member's claimed budget, other processes, free."""
+    total = max(ge.gpu.memory_bytes, 1)
+    sets: dict[str, list[tuple[int, ServeConfig, Estimate]]] = {}
+    for i, (cfg, est) in enumerate(ge.members):
+        if isinstance(est, Estimate):
+            sets.setdefault(device_set(cfg), []).append((i, cfg, est))
+    parts: list[RenderableType] = []
+    for devices, items in sets.items():
+        if len(sets) > 1:
+            parts.append(Text(f"CUDA_VISIBLE_DEVICES={devices}", style="grey62"))
+        segs = [
+            (c.short_name, e.budget_bytes, MEMBER_COLORS[i % len(MEMBER_COLORS)])
+            for i, c, e in items
+        ]
+        if ge.gpu.used_bytes:
+            segs.append(("other processes", ge.gpu.used_bytes, "grey50"))
+        claimed = sum(b for _, b, _ in segs)
+        segs.append(("free", max(total - claimed, 0), "grey23"))
+        line = Text()
+        used = 0
+        for _, b, color in segs:
+            cells = min(round(b / total * width), width - used)
+            line.append("█" * cells, style=color if claimed <= total else f"{color} on red")
+            used += cells
+        if claimed > total:
+            line.append(" overcommitted", style="bold red")
+        legend = Table.grid(padding=(0, 2))
+        legend.add_column()
+        legend.add_column(justify="right")
+        legend.add_column(justify="right", style="grey62")
+        for label, b, color in segs:
+            legend.add_row(Text("■ ", style=color) + Text(label), gib(b), f"{b / total:.0%}")
+        parts += [line, legend, Text()]
+    return Group(*parts)
+
+
+def group_member_table(ge: GroupEstimate) -> RenderableType:
+    t = Table(box=None, padding=(0, 2), header_style="bold")
+    t.add_column("member", no_wrap=True)
+    for col in ("util", "budget", "weights", "KV tokens", "concurrency", "tok/s 1 · batch"):
+        t.add_column(col, justify="right", no_wrap=True)
+    t.add_column("", no_wrap=True)
+    for i, (cfg, est) in enumerate(ge.members):
+        name = Text("■ ", style=MEMBER_COLORS[i % len(MEMBER_COLORS)]) + Text(
+            cfg.short_name, style="bold"
+        )
+        if isinstance(est, str):
+            t.add_row(name, "", "", "", "", "", "", Text("✖ " + est, style="red"))
+            continue
+        t.add_row(
+            name,
+            f"{est.gpu_memory_utilization:.2f}",
+            gib(est.budget_bytes),
+            gib(est.weight_bytes),
+            f"{est.kv_capacity_tokens:,}",
+            f"{est.max_concurrency:.1f}×",
+            f"{est.single_stream_tps:,.0f} · {est.batch_tps:,.0f}",
+            Text("✓", style="green") if est.fits else Text("✖", style="red"),
+        )
+    return t
+
+
+def group_estimate_report(ge: GroupEstimate) -> RenderableType:
+    verdict = (
+        Text(" FITS ", style="bold black on green")
+        if ge.fits
+        else Text(" DOES NOT FIT ", style="bold white on red")
+    )
+    g = ge.gpu
+    head = Text.assemble(
+        ("hardware  ", "grey62"),
+        f"{ge.num_gpus}× {g.name}  ",
+        (f"{gib(g.memory_bytes)}, {g.bandwidth_gbs:,.0f} GB/s", "grey62"),
+    )
+    parts: list[RenderableType] = [
+        head,
+        Text(),
+        Text("VRAM claimed per GPU", style="bold"),
+        group_memory_bar(ge),
+        group_member_table(ge),
+    ]
+    lines = [Text("✖ " + e, style="bold red") for e in ge.errors]
+    lines += [Text("⚠ " + w, style="yellow") for w in ge.warnings]
+    lines += [Text("ℹ " + n, style="grey62") for n in ge.notes]
+    if lines:
+        parts += [Text(), *lines]
+    summary = Panel(
+        Group(*parts),
+        title=Text.assemble(f" {ge.name} (group) ", verdict),
+        border_style="green" if ge.fits else "red",
+    )
+    details = [estimate_report(e) for _, e in ge.members if isinstance(e, Estimate)]
+    return Group(summary, *details)
+
+
+def group_details(group: GroupConfig, statuses: dict[str, Status]) -> RenderableType:
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="grey62")
+    t.add_column()
+    if group.description:
+        t.add_row("description", group.description)
+    t.add_row("file", str(group.path) if group.path else "-")
+    t.add_row("start order", " → ".join(m.short_name for m in group.members))
+    members = Table(box=None, padding=(0, 2), header_style="bold")
+    for col in ("member", "status", "model", "endpoint", "util"):
+        members.add_column(col, no_wrap=True)
+    for i, m in enumerate(group.members):
+        st = statuses.get(m.name)
+        members.add_row(
+            Text("■ ", style=MEMBER_COLORS[i % len(MEMBER_COLORS)])
+            + Text(m.short_name, style="bold"),
+            state_badge(st.state if st else State.STOPPED),
+            Text(m.model, style="cyan"),
+            f"{m.base_url}/v1",
+            str(m.arg("gpu-memory-utilization", 0.9)),
+        )
+    cmds = [Text()]
+    for m in group.members:
+        cmds += [Text(m.short_name, style="grey62"), Text(" ".join(m.command()), style="grey70")]
+    return Group(t, Text(), members, *cmds)
+
+
+def group_state(group: GroupConfig, statuses: dict[str, Status]) -> State:
+    """Running only when every member is; starting if any is starting; stopped when all are."""
+    states = [
+        statuses[m.name].state if m.name in statuses else State.STOPPED for m in group.members
+    ]
+    if all(s is State.RUNNING for s in states):
+        return State.RUNNING
+    if any(s in (State.STARTING, State.RUNNING) for s in states):
+        return State.STARTING if any(s is State.STARTING for s in states) else State.PARTIAL
+    if any(s is State.STALE for s in states):
+        return State.STALE
+    return State.STOPPED

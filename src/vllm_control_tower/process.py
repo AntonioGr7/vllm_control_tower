@@ -24,6 +24,7 @@ class State(str, Enum):
     RUNNING = "running"
     UNHEALTHY = "unhealthy"
     STALE = "stale"  # PID file left behind by a process that died
+    PARTIAL = "partial"  # groups only: some members up, some down
 
 
 @dataclass

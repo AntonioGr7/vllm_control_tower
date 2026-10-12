@@ -7,6 +7,9 @@ port: 8000
 env:
   HF_TOKEN: ${HF_TOKEN}
   VLLM_LOGGING_LEVEL: INFO
+  # FlashInfer JIT-compiles its sampler with the system nvcc; CUDA < 12.8 fails on
+  # --compress-mode. Use vLLM's PyTorch sampler instead (no compilation needed).
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
 vllm:
   executable: vllm
   args:

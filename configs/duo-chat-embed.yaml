@@ -1,0 +1,52 @@
+# Two models on one GPU: a chat model and an embedding model for RAG.
+#
+# Every vLLM instance claims `gpu-memory-utilization × total VRAM` for itself, so on a
+# shared GPU the members' utilizations must add up to less than what is actually free
+# (on WSL/desktop the display already holds ~0.5 GB). Members start in the order listed,
+# each one after the previous is healthy, and stop in reverse order.
+#
+#   vct estimate duo-chat-embed     # checks the combined budget
+#   vct start duo-chat-embed        # chat on :8010, embeddings on :8011
+#   vct stop duo-chat-embed
+name: duo-chat-embed
+description: Qwen3 0.6B FP8 chat + BGE-small embeddings sharing a 4 GB GPU
+host: 127.0.0.1
+env:                      # shared by every member; a member's own env wins
+  HF_TOKEN: ${HF_TOKEN}
+  VLLM_LOGGING_LEVEL: INFO
+  # FlashInfer JIT-compiles its sampler with the system nvcc; CUDA < 12.8 fails on
+  # --compress-mode. Use vLLM's PyTorch sampler instead (no compilation needed).
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+models:
+  - name: chat
+    model: Qwen/Qwen3-0.6B-FP8
+    port: 8010
+    vllm:
+      args:
+        served-model-name: qwen3-chat
+        gpu-memory-utilization: 0.6
+        max-model-len: 4096
+        max-num-seqs: 8
+        max-num-batched-tokens: 1024
+      flags:
+        - enforce-eager   # no CUDA graph memory: every MiB counts on a shared 4 GB card
+    estimate:
+      avg_prompt_tokens: 512
+      avg_output_tokens: 256
+
+  - name: embed
+    model: BAAI/bge-small-en-v1.5   # 33M-param BERT encoder, 384-dim vectors
+    port: 8011
+    vllm:
+      args:
+        served-model-name: bge-small
+        runner: pooling   # serve /v1/embeddings instead of text generation
+        gpu-memory-utilization: 0.2
+        max-model-len: 512
+        max-num-seqs: 32
+        max-num-batched-tokens: 4096
+      flags:
+        - enforce-eager
+    estimate:
+      avg_prompt_tokens: 256
+      avg_output_tokens: 1
