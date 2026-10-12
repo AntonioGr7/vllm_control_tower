@@ -29,6 +29,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_control_tower"]
 
+[tool.uv]
+# opencv-python-headless 5.0.0.93 (pulled in by vLLM) ships wheels with broken metadata.
+constraint-dependencies = ["opencv-python-headless<5"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
