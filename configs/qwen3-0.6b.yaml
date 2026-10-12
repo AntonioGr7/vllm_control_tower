@@ -1,0 +1,23 @@
+# Small bf16 model that fits a 4 GB laptop GPU.
+name: qwen3-0.6b
+description: Qwen3 0.6B, bf16, sized for a 4 GB GPU
+model: Qwen/Qwen3-0.6B
+host: 127.0.0.1
+port: 8000
+env:
+  HF_TOKEN: ${HF_TOKEN}
+  VLLM_LOGGING_LEVEL: INFO
+vllm:
+  executable: vllm
+  args:
+    served-model-name: qwen3-0.6b
+    dtype: auto
+    gpu-memory-utilization: 0.8
+    max-model-len: 4096
+    max-num-seqs: 16
+    max-num-batched-tokens: 2048
+  flags: []
+  extra_args: []
+estimate:
+  avg_prompt_tokens: 512
+  avg_output_tokens: 256

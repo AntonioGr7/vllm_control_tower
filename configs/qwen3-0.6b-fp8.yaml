@@ -1,0 +1,15 @@
+# FP8 checkpoint: smaller weights leave more room for KV cache.
+# On Ampere (sm86) vLLM runs FP8 weights through Marlin weight-only kernels.
+name: qwen3-0.6b-fp8
+description: Qwen3 0.6B FP8, longer context on a 4 GB GPU
+model: Qwen/Qwen3-0.6B-FP8
+port: 8001
+vllm:
+  args:
+    served-model-name: qwen3-0.6b-fp8
+    gpu-memory-utilization: 0.8
+    max-model-len: 8192
+    max-num-seqs: 16
+    kv-cache-dtype: auto
+  flags:
+    - enforce-eager

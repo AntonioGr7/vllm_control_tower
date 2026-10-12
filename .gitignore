@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+plan.md
+
 # Distribution / packaging
 .Python
 build/
@@ -218,3 +220,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# vLLM Control Tower runtime state (PID files, logs, model metadata cache)
+.vct/
