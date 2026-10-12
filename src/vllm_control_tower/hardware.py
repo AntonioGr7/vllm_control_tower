@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, replace
 
 GiB = 1024**3
@@ -92,49 +93,64 @@ def known_gpu_names() -> list[str]:
     return [k[0] for k in _KNOWN]
 
 
+# NVML is process-global: initialise it once and never shut it down mid-run. The TUI
+# polls GPUs from one thread while estimates run in another; per-call init/shutdown let
+# one thread tear NVML down under the other and made static readings flap.
+_nvml_lock = threading.Lock()
+_nvml_state: dict[str, object] = {"module": None, "failed": False}
+# Static per-device facts (bandwidth, compute, capability), read once per process.
+_static: dict[int, tuple[float | None, float | None, tuple[int, int] | None]] = {}
+
+
+def _nvml():
+    if _nvml_state["module"] is None and not _nvml_state["failed"]:
+        try:
+            import pynvml as nv
+
+            nv.nvmlInit()
+            _nvml_state["module"] = nv
+        except Exception:
+            _nvml_state["failed"] = True
+    return _nvml_state["module"]
+
+
 def detect_gpus() -> list[GpuSpec]:
     """Return locally visible NVIDIA GPUs, or [] if NVML is unavailable."""
-    try:
-        import pynvml as nv
-    except ImportError:
-        return []
-    try:
-        nv.nvmlInit()
-    except Exception:
-        return []
-    gpus: list[GpuSpec] = []
-    try:
-        for i in range(nv.nvmlDeviceGetCount()):
-            h = nv.nvmlDeviceGetHandleByIndex(i)
-            name = nv.nvmlDeviceGetName(h)
-            name = name.decode() if isinstance(name, bytes) else name
-            mem = nv.nvmlDeviceGetMemoryInfo(h)
-            cc = _try(lambda h=h: tuple(nv.nvmlDeviceGetCudaComputeCapability(h)))
-            util = _try(lambda h=h: nv.nvmlDeviceGetUtilizationRates(h).gpu)
-            temp = _try(lambda h=h: nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU))
-            power = _try(lambda h=h: nv.nvmlDeviceGetPowerUsage(h) / 1000)
+    with _nvml_lock:
+        nv = _nvml()
+        if nv is None:
+            return []
+        try:
+            return [_read_gpu(nv, i) for i in range(nv.nvmlDeviceGetCount())]
+        except Exception:
+            return []
 
-            known = lookup(name)
-            bandwidth = _nvml_bandwidth(nv, h) or (known.bandwidth_gbs if known else None)
-            tflops = known.tflops_16 if known else _nvml_tflops(nv, h, cc)
-            gpus.append(
-                GpuSpec(
-                    name=name,
-                    memory_bytes=mem.total,
-                    bandwidth_gbs=bandwidth or 300.0,
-                    tflops_16=tflops or 30.0,
-                    compute_capability=cc or (known.compute_capability if known else None),
-                    index=i,
-                    used_bytes=mem.used,
-                    utilization=util,
-                    temperature=temp,
-                    power_w=power,
-                    source="nvml",
-                )
-            )
-    finally:
-        _try(nv.nvmlShutdown)
-    return gpus
+
+def _read_gpu(nv, i: int) -> GpuSpec:
+    h = nv.nvmlDeviceGetHandleByIndex(i)
+    name = nv.nvmlDeviceGetName(h)
+    name = name.decode() if isinstance(name, bytes) else name
+    mem = nv.nvmlDeviceGetMemoryInfo(h)
+    known = lookup(name)
+    if i not in _static or None in _static[i]:
+        cc = _try(lambda: tuple(nv.nvmlDeviceGetCudaComputeCapability(h)))
+        bandwidth = _nvml_bandwidth(nv, h)
+        tflops = known.tflops_16 if known else _nvml_tflops(nv, h, cc)
+        _static[i] = (bandwidth, tflops, cc)
+    bandwidth, tflops, cc = _static[i]
+    return GpuSpec(
+        name=name,
+        memory_bytes=mem.total,
+        bandwidth_gbs=bandwidth or (known.bandwidth_gbs if known else 300.0),
+        tflops_16=tflops or 30.0,
+        compute_capability=cc or (known.compute_capability if known else None),
+        index=i,
+        used_bytes=mem.used,
+        utilization=_try(lambda: nv.nvmlDeviceGetUtilizationRates(h).gpu),
+        temperature=_try(lambda: nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU)),
+        power_w=_try(lambda: nv.nvmlDeviceGetPowerUsage(h) / 1000),
+        source="nvml",
+    )
 
 
 def resolve_hardware(gpu: str | None = None, num_gpus: int | None = None) -> tuple[GpuSpec, int]:

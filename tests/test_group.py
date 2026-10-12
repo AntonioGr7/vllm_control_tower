@@ -73,7 +73,8 @@ def test_group_estimate_checks_combined_budget(write_config):
 
     busy = GpuSpec("RTX 2050", 4 * GiB, 96, 12, (8, 6), used_bytes=int(1 * GiB), source="nvml")
     ge = estimate_group("duo", _estimates(group, busy), busy)
-    assert any("share the same GPU" in e and "<= 0.74" in e for e in ge.errors)
+    # 3 GiB free - 2 CUDA contexts (0.2 GiB each) = 2.6 GiB -> 0.65 of 4 GiB, minus margin
+    assert any("share the same GPU" in e and "<= 0.64" in e for e in ge.errors)
     assert not ge.fits
 
 

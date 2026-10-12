@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -18,6 +19,14 @@ DTYPE_BYTES = {
     "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "I8": 1, "U8": 1, "BOOL": 1,
     "F4": 0.5, "F6_E2M3": 0.75, "F6_E3M2": 0.75,
 }  # fmt: skip
+
+
+# Bump when the way weights are counted changes, so cached results are recomputed.
+CACHE_VERSION = 2
+
+# Output projections that duplicate the input embedding when tie_word_embeddings is set.
+# Checkpoints often store the copy anyway; vLLM loads only one.
+TIED_HEAD_SUFFIXES = ("lm_head.weight",)
 
 
 @dataclass
@@ -94,7 +103,9 @@ def get_model_info(
     if local.is_dir():
         return _from_local_dir(model, local)
 
-    cache_file = runtime_dir / "cache" / "models" / (model.replace("/", "--") + ".json")
+    cache_file = (
+        runtime_dir / "cache" / "models" / f"{model.replace('/', '--')}.v{CACHE_VERSION}.json"
+    )
     if cache_file.exists():
         try:
             return ModelInfo(**json.loads(cache_file.read_text()))
@@ -207,18 +218,25 @@ def _apply_weights(info: ModelInfo, dtype_counts: dict[str, int], source: str) -
     return info
 
 
-def _read_safetensors_header(path: Path) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def _read_safetensors_header(path: Path) -> dict[str, tuple[str, int]]:
+    """Tensor name -> (dtype, element count), read from the file header only."""
     with path.open("rb") as f:
         (n,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(n))
-    for key, t in header.items():
-        if key == "__metadata__":
+    return {
+        key: (t["dtype"], math.prod(t["shape"]))
+        for key, t in header.items()
+        if key != "__metadata__"
+    }
+
+
+def _count(info: ModelInfo, tensors: dict[str, tuple[str, int]]) -> dict[str, int]:
+    """Element counts per dtype for the tensors vLLM actually loads."""
+    counts: dict[str, int] = {}
+    for name, (dtype, numel) in tensors.items():
+        if info.tie_embeddings and name.endswith(TIED_HEAD_SUFFIXES):
             continue
-        numel = 1
-        for d in t["shape"]:
-            numel *= d
-        counts[t["dtype"]] = counts.get(t["dtype"], 0) + numel
+        counts[dtype] = counts.get(dtype, 0) + numel
     return counts
 
 
@@ -227,11 +245,10 @@ def _from_local_dir(model_id: str, path: Path) -> ModelInfo:
     if not cfg_path.exists():
         raise ModelInfoError(f"{path} has no config.json")
     info = parse_config(model_id, json.loads(cfg_path.read_text()))
-    counts: dict[str, int] = {}
+    tensors: dict[str, tuple[str, int]] = {}
     for st in sorted(path.glob("*.safetensors")):
-        for dt, n in _read_safetensors_header(st).items():
-            counts[dt] = counts.get(dt, 0) + n
-    return _apply_weights(info, counts, "safetensors")
+        tensors.update(_read_safetensors_header(st))
+    return _apply_weights(info, _count(info, tensors), "safetensors")
 
 
 def _from_hf_cache(model_id: str) -> ModelInfo | None:
@@ -248,11 +265,10 @@ def _from_hf_cache(model_id: str) -> ModelInfo | None:
     index = snap / "model.safetensors.index.json"
     expected = set(json.loads(index.read_text())["weight_map"].values()) if index.exists() else None
     if shards and (expected is None or expected <= {s.name for s in shards}):
-        counts: dict[str, int] = {}
+        tensors: dict[str, tuple[str, int]] = {}
         for st in shards:
-            for dt, n in _read_safetensors_header(st).items():
-                counts[dt] = counts.get(dt, 0) + n
-        return _apply_weights(info, counts, "safetensors")
+            tensors.update(_read_safetensors_header(st))
+        return _apply_weights(info, _count(info, tensors), "safetensors")
     return info
 
 
@@ -269,13 +285,11 @@ def _from_hub(model_id: str) -> ModelInfo:
     info = parse_config(model_id, cfg)
     try:
         meta = get_safetensors_metadata(model_id)
-        counts: dict[str, int] = {}
-        for fm in meta.files_metadata.values():
-            for t in fm.tensors.values():
-                numel = 1
-                for d in t.shape:
-                    numel *= d
-                counts[t.dtype] = counts.get(t.dtype, 0) + numel
-        return _apply_weights(info, counts, "safetensors")
+        tensors = {
+            name: (t.dtype, math.prod(t.shape))
+            for fm in meta.files_metadata.values()
+            for name, t in fm.tensors.items()
+        }
+        return _apply_weights(info, _count(info, tensors), "safetensors")
     except Exception:
         return info

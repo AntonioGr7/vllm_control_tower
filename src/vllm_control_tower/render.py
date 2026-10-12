@@ -276,6 +276,8 @@ def group_memory_bar(ge: GroupEstimate, width: int = 60) -> RenderableType:
             (c.short_name, e.budget_bytes, MEMBER_COLORS[i % len(MEMBER_COLORS)])
             for i, c, e in items
         ]
+        contexts = sum(e.cuda_context_bytes for _, _, e in items)
+        segs.append((f"CUDA contexts ({len(items)}×)", contexts, "grey42"))
         if ge.gpu.used_bytes:
             segs.append(("other processes", ge.gpu.used_bytes, "grey50"))
         claimed = sum(b for _, b, _ in segs)

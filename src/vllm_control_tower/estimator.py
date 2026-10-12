@@ -5,6 +5,9 @@ The memory model mirrors how vLLM sizes its KV cache at startup:
     budget   = total_vram * gpu_memory_utilization
     kv_cache = budget - weights - activation_peak - cuda_graphs - non_torch_overhead
 
+The CUDA context sits outside that budget, but vLLM refuses to start unless the free
+memory it sees after creating the context covers the whole budget.
+
 Throughput uses a roofline model: a decode step is bound by reading the weights plus the
 KV cache of the running batch from HBM, or by compute, whichever is slower. Expect the
 numbers to be within ~20-30% of reality; benchmark before relying on them.
@@ -20,6 +23,13 @@ from .model_info import ModelInfo
 
 MiB = 1024**2
 BLOCK_SIZE = 16
+
+# Calibrated against vLLM 0.30 on an RTX 2050 (Qwen3-0.6B-FP8, eager): vLLM reported
+# 0.08 GiB of non-torch memory inside the budget, and free memory dropped ~0.2 GiB
+# for the CUDA context before its startup check.
+NON_TORCH_BYTES = int(0.1 * GiB)
+NCCL_BYTES = int(0.25 * GiB)  # extra buffers once tensor/pipeline parallel is used
+CUDA_CONTEXT_BYTES = int(0.2 * GiB)
 
 # Efficiency factors applied to peak hardware numbers.
 BANDWIDTH_EFFICIENCY = 0.75
@@ -72,6 +82,7 @@ class Estimate:
     activation_bytes: int
     cuda_graph_bytes: int
     overhead_bytes: int
+    cuda_context_bytes: int  # outside the gpu-memory-utilization budget
     kv_cache_bytes: int
     kv_bytes_per_token: float
     kv_capacity_tokens: int
@@ -101,6 +112,7 @@ class Estimate:
             + self.cuda_graph_bytes
             + self.overhead_bytes
             + max(self.kv_cache_bytes, 0)
+            + self.cuda_context_bytes
         )
         return [
             MemorySegment("weights", self.weight_bytes, "dodger_blue1"),
@@ -108,6 +120,7 @@ class Estimate:
             MemorySegment("cuda graphs", self.cuda_graph_bytes, "orchid"),
             MemorySegment("runtime overhead", self.overhead_bytes, "grey62"),
             MemorySegment("KV cache", max(self.kv_cache_bytes, 0), "spring_green2"),
+            MemorySegment("CUDA context (outside budget)", self.cuda_context_bytes, "grey42"),
             MemorySegment("reserved / free", max(self.total_bytes - used, 0), "grey23"),
         ]
 
@@ -221,8 +234,9 @@ def estimate(
     offload = float(cfg.arg("cpu-offload-gb", 0)) * 1e9
     weights = int(max(weights_total - offload, 0) / shards)
 
-    # Peak activations of the profiling forward pass (max_num_batched_tokens tokens) plus
-    # fp32 logits for up to max_num_seqs sampled rows.
+    # Peak activations of the profiling forward pass over max_num_batched_tokens tokens:
+    # the residual stream plus the largest intermediate alive at once (the fused MLP
+    # gate/up output or the fused QKV projection), plus fp32 logits for the sampled rows.
     h = model.hidden_size
     inter = (
         (model.moe_intermediate_size * max(model.experts_per_token, 1))
@@ -230,12 +244,13 @@ def estimate(
         else model.intermediate_size
     )
     q_kv = (model.num_heads + 2 * model.num_kv_heads) * model.head_dim
-    per_token_act = (4 * h + (3 * inter + q_kv) / tp) * act_elem
+    per_token_act = (2 * h + max(2 * inter, q_kv) / tp) * act_elem
     logits_rows = min(max_num_seqs, max_batched)
-    activations = int(max_batched * per_token_act + logits_rows * model.vocab_size / tp * 4 * 2)
+    activations = int(max_batched * per_token_act + logits_rows * model.vocab_size / tp * 4)
 
     graphs = 0 if enforce_eager else int(min(1 * GiB, 64 * MiB + model.num_layers / pp * 6 * MiB))
-    overhead = int(0.35 * GiB + (0.25 * GiB if shards > 1 else 0))
+    overhead = NON_TORCH_BYTES + (NCCL_BYTES if shards > 1 else 0)
+    context = CUDA_CONTEXT_BYTES
 
     kv_cache = budget - weights - activations - graphs - overhead
     kv_mem_override = cfg.arg("kv-cache-memory") or cfg.arg("kv-cache-memory-bytes")
@@ -249,11 +264,15 @@ def estimate(
     )
     max_concurrency = kv_tokens / max_model_len if max_model_len else 0.0
 
-    if gpu.used_bytes and budget > gpu.free_bytes:
-        max_util = (gpu.free_bytes / total) - 0.01
+    # vLLM's startup check: free memory after creating the CUDA context >= budget.
+    available = (gpu.free_bytes if gpu.used_bytes else total) - context
+    if budget > available:
+        max_util = (available / total) - 0.01
+        others = (
+            f" ({gpu.used_bytes / GiB:.2f} GiB used by other processes)" if gpu.used_bytes else ""
+        )
         errors.append(
-            f"only {gpu.free_bytes / GiB:.2f} GiB free on {gpu.name} "
-            f"({gpu.used_bytes / GiB:.2f} GiB used by other processes) but "
+            f"only {available / GiB:.2f} GiB free on {gpu.name} after the CUDA context{others} but "
             f"gpu-memory-utilization={util} requests {budget / GiB:.2f} GiB; use <= {max_util:.2f}"
         )
     if weights > budget:
@@ -357,6 +376,7 @@ def estimate(
         activation_bytes=activations,
         cuda_graph_bytes=graphs,
         overhead_bytes=overhead,
+        cuda_context_bytes=context,
         kv_cache_bytes=kv_cache,
         kv_bytes_per_token=kv_per_token,
         kv_capacity_tokens=kv_tokens,
@@ -429,13 +449,15 @@ def estimate_group(
     for cfg, est in members:
         if isinstance(est, Estimate):
             by_device.setdefault(device_set(cfg), []).append((cfg, est))
-    available = gpu.free_bytes if gpu.used_bytes else gpu.memory_bytes
+    free = gpu.free_bytes if gpu.used_bytes else gpu.memory_bytes
     for devices, items in by_device.items():
         if len(items) < 2:
             continue
         where = "the same GPU" if devices == "default" else f"CUDA_VISIBLE_DEVICES={devices}"
         total_util = sum(e.gpu_memory_utilization for _, e in items)
+        # Every instance also creates its own CUDA context outside its budget.
         requested = sum(e.budget_bytes for _, e in items)
+        available = free - sum(e.cuda_context_bytes for _, e in items)
         names = ", ".join(c.short_name for c, _ in items)
         if requested > available:
             ge.errors.append(

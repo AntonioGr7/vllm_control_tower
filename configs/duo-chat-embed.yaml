@@ -2,7 +2,8 @@
 #
 # Every vLLM instance claims `gpu-memory-utilization × total VRAM` for itself, so on a
 # shared GPU the members' utilizations must add up to less than what is actually free
-# (on WSL/desktop the display already holds ~0.5 GB). Members start in the order listed,
+# (on WSL/desktop the display already holds ~0.5 GB), and each instance also creates
+# its own ~0.2 GB CUDA context outside its budget. Members start in the order listed,
 # each one after the previous is healthy, and stop in reverse order.
 #
 #   vct estimate duo-chat-embed     # checks the combined budget
@@ -24,7 +25,7 @@ models:
     vllm:
       args:
         served-model-name: qwen3-chat
-        gpu-memory-utilization: 0.6
+        gpu-memory-utilization: 0.55
         max-model-len: 4096
         max-num-seqs: 8
         max-num-batched-tokens: 1024
@@ -41,7 +42,7 @@ models:
       args:
         served-model-name: bge-small
         runner: pooling   # serve /v1/embeddings instead of text generation
-        gpu-memory-utilization: 0.2
+        gpu-memory-utilization: 0.18
         max-model-len: 512
         max-num-seqs: 32
         max-num-batched-tokens: 4096

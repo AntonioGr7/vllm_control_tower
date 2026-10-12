@@ -120,3 +120,48 @@ def test_gpu_lookup():
     assert lookup("4090").name == "RTX 4090"
     assert lookup("NVIDIA H100 80GB HBM3").name == "H100"
     assert lookup("unknown thing") is None
+
+
+def test_tied_lm_head_copy_is_not_counted(tmp_path):
+    import struct
+
+    model_dir = tmp_path / "tied"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(QWEN3_06B))  # tie_word_embeddings: true
+    tensors = {
+        "model.embed_tokens.weight": {"dtype": "BF16", "shape": [10, 10], "data_offsets": [0, 200]},
+        "lm_head.weight": {"dtype": "BF16", "shape": [10, 10], "data_offsets": [200, 400]},
+        "model.layers.0.mlp.weight": {
+            "dtype": "F8_E4M3",
+            "shape": [10, 5],
+            "data_offsets": [400, 450],
+        },
+    }
+    header = json.dumps(tensors).encode()
+    (model_dir / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\0" * 450
+    )
+    info = get_model_info(str(model_dir), runtime_dir=tmp_path / "rt")
+    assert info.dtype_counts == {"BF16": 100, "F8_E4M3": 50}
+    assert info.weight_bytes == 250
+
+
+def test_matches_vllm_on_rtx2050():
+    """vLLM 0.30, Qwen3-0.6B-FP8, util 0.8, eager: 0.74 GiB weights, 2.33 GiB / 21,824 KV tokens."""
+    info = parse_config(
+        "Qwen/Qwen3-0.6B-FP8", {**QWEN3_06B, "quantization_config": {"quant_method": "fp8"}}
+    )
+    info.dtype_counts = {"BF16": 155_674_880, "F8_E4M3": 440_401_920}
+    info.weight_bytes = 155_674_880 * 2 + 440_401_920
+    cfg = ServeConfig(
+        name="fp8",
+        model="Qwen/Qwen3-0.6B-FP8",
+        vllm={
+            "args": {"gpu-memory-utilization": 0.8, "max-model-len": 8192, "max-num-seqs": 16},
+            "flags": ["enforce-eager"],
+        },
+    )
+    est = estimate(cfg, info, RTX2050)
+    assert est.fits
+    assert est.kv_cache_bytes / GiB == pytest.approx(2.33, abs=0.08)
+    assert est.kv_capacity_tokens == pytest.approx(21_824, rel=0.04)
