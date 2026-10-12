@@ -415,7 +415,7 @@ def discount_running(gpu: GpuSpec, running: list[ServeConfig]) -> GpuSpec:
 
 
 @dataclass
-class GroupEstimate:
+class DeploymentEstimate:
     name: str
     gpu: GpuSpec  # with running members' memory already discounted
     num_gpus: int
@@ -433,18 +433,18 @@ def device_set(cfg: ServeConfig) -> str:
     return cfg.resolved_env().get("CUDA_VISIBLE_DEVICES", "default")
 
 
-def estimate_group(
+def estimate_deployment(
     name: str,
     members: list[tuple[ServeConfig, Estimate | str]],
     gpu: GpuSpec,
     num_gpus: int = 1,
-) -> GroupEstimate:
+) -> DeploymentEstimate:
     """Check that members sharing a GPU fit together.
 
     Every vLLM instance claims gpu-memory-utilization × total VRAM for itself and refuses
     to start if that much isn't free, so members on the same device must sum below it.
     """
-    ge = GroupEstimate(name, gpu, num_gpus, members)
+    ge = DeploymentEstimate(name, gpu, num_gpus, members)
     by_device: dict[str, list[tuple[ServeConfig, Estimate]]] = {}
     for cfg, est in members:
         if isinstance(est, Estimate):
@@ -469,7 +469,7 @@ def estimate_group(
             ge.warnings.append(f"{names} together claim {total_util:.0%} of VRAM on {where}")
     if len(by_device) == 1 and len(members) > 1:
         ge.notes.append(
-            "members start one after another; each waits for the previous one to be healthy "
+            "models start one after another; each waits for the previous one to be healthy "
             "so vLLM's memory profiling sees the right free memory"
         )
     return ge

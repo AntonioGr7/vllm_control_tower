@@ -7,8 +7,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .config import GroupConfig, ServeConfig
-from .estimator import Estimate, GroupEstimate, device_set
+from .config import Deployment, ServeConfig
+from .estimator import DeploymentEstimate, Estimate, device_set
 from .hardware import GiB, GpuSpec
 from .process import State, Status
 
@@ -170,7 +170,7 @@ def diagnostics(est: Estimate) -> RenderableType | None:
     return Group(*lines) if lines else None
 
 
-def estimate_report(est: Estimate) -> RenderableType:
+def estimate_report(est: Estimate, title: str | None = None) -> RenderableType:
     verdict = (
         Text(" FITS ", style="bold black on green")
         if est.fits
@@ -190,7 +190,7 @@ def estimate_report(est: Estimate) -> RenderableType:
         parts += [Text(), diag]
     return Panel(
         Group(*parts),
-        title=Text.assemble(f" {est.config_name} ", verdict),
+        title=Text.assemble(f" {title or est.config_name} ", verdict),
         border_style="green" if est.fits else "red",
     )
 
@@ -218,7 +218,9 @@ def gpu_table(gpus: list[GpuSpec]) -> RenderableType:
     return t
 
 
-def config_details(cfg: ServeConfig, status: Status | None = None) -> RenderableType:
+def config_details(
+    cfg: ServeConfig, status: Status | None = None, description: str = ""
+) -> RenderableType:
     t = Table.grid(padding=(0, 2))
     t.add_column(style="grey62")
     t.add_column()
@@ -229,8 +231,8 @@ def config_details(cfg: ServeConfig, status: Status | None = None) -> Renderable
             if status.uptime_s is not None:
                 badge.append(f"  up {_duration(status.uptime_s)}", style="grey62")
         t.add_row("status", badge)
-    if cfg.description:
-        t.add_row("description", cfg.description)
+    if description or cfg.description:
+        t.add_row("description", description or cfg.description)
     t.add_row("model", Text(cfg.model, style="bold cyan"))
     t.add_row("endpoint", f"{cfg.base_url}/v1")
     t.add_row("file", str(cfg.path) if cfg.path else "-")
@@ -261,7 +263,7 @@ MEMBER_COLORS = [
 ]
 
 
-def group_memory_bar(ge: GroupEstimate, width: int = 60) -> RenderableType:
+def deployment_memory_bar(ge: DeploymentEstimate, width: int = 60) -> RenderableType:
     """One stacked bar per device set: each member's claimed budget, other processes, free."""
     total = max(ge.gpu.memory_bytes, 1)
     sets: dict[str, list[tuple[int, ServeConfig, Estimate]]] = {}
@@ -300,9 +302,9 @@ def group_memory_bar(ge: GroupEstimate, width: int = 60) -> RenderableType:
     return Group(*parts)
 
 
-def group_member_table(ge: GroupEstimate) -> RenderableType:
+def deployment_member_table(ge: DeploymentEstimate) -> RenderableType:
     t = Table(box=None, padding=(0, 2), header_style="bold")
-    t.add_column("member", no_wrap=True)
+    t.add_column("model", no_wrap=True)
     for col in ("util", "budget", "weights", "KV tokens", "concurrency", "tok/s 1 · batch"):
         t.add_column(col, justify="right", no_wrap=True)
     t.add_column("", no_wrap=True)
@@ -326,40 +328,48 @@ def group_member_table(ge: GroupEstimate) -> RenderableType:
     return t
 
 
-def group_estimate_report(ge: GroupEstimate) -> RenderableType:
+def deployment_estimate_report(de: DeploymentEstimate) -> RenderableType:
+    if len(de.members) == 1:
+        _, est = de.members[0]
+        if isinstance(est, str):
+            return Text(est, style="red")
+        return estimate_report(est, title=de.name)
     verdict = (
         Text(" FITS ", style="bold black on green")
-        if ge.fits
+        if de.fits
         else Text(" DOES NOT FIT ", style="bold white on red")
     )
-    g = ge.gpu
+    g = de.gpu
     head = Text.assemble(
         ("hardware  ", "grey62"),
-        f"{ge.num_gpus}× {g.name}  ",
+        f"{de.num_gpus}× {g.name}  ",
         (f"{gib(g.memory_bytes)}, {g.bandwidth_gbs:,.0f} GB/s", "grey62"),
     )
     parts: list[RenderableType] = [
         head,
         Text(),
         Text("VRAM claimed per GPU", style="bold"),
-        group_memory_bar(ge),
-        group_member_table(ge),
+        deployment_memory_bar(de),
+        deployment_member_table(de),
     ]
-    lines = [Text("✖ " + e, style="bold red") for e in ge.errors]
-    lines += [Text("⚠ " + w, style="yellow") for w in ge.warnings]
-    lines += [Text("ℹ " + n, style="grey62") for n in ge.notes]
+    lines = [Text("✖ " + e, style="bold red") for e in de.errors]
+    lines += [Text("⚠ " + w, style="yellow") for w in de.warnings]
+    lines += [Text("ℹ " + n, style="grey62") for n in de.notes]
     if lines:
         parts += [Text(), *lines]
     summary = Panel(
         Group(*parts),
-        title=Text.assemble(f" {ge.name} (group) ", verdict),
-        border_style="green" if ge.fits else "red",
+        title=Text.assemble(f" {de.name} ({len(de.members)} models) ", verdict),
+        border_style="green" if de.fits else "red",
     )
-    details = [estimate_report(e) for _, e in ge.members if isinstance(e, Estimate)]
+    details = [estimate_report(e) for _, e in de.members if isinstance(e, Estimate)]
     return Group(summary, *details)
 
 
-def group_details(group: GroupConfig, statuses: dict[str, Status]) -> RenderableType:
+def deployment_details(group: Deployment, statuses: dict[str, Status]) -> RenderableType:
+    if group.single:
+        m = group.members[0]
+        return config_details(m, statuses.get(m.name), group.description)
     t = Table.grid(padding=(0, 2))
     t.add_column(style="grey62")
     t.add_column()
@@ -368,7 +378,7 @@ def group_details(group: GroupConfig, statuses: dict[str, Status]) -> Renderable
     t.add_row("file", str(group.path) if group.path else "-")
     t.add_row("start order", " → ".join(m.short_name for m in group.members))
     members = Table(box=None, padding=(0, 2), header_style="bold")
-    for col in ("member", "status", "model", "endpoint", "util"):
+    for col in ("name", "status", "model", "endpoint", "util"):
         members.add_column(col, no_wrap=True)
     for i, m in enumerate(group.members):
         st = statuses.get(m.name)
@@ -386,8 +396,8 @@ def group_details(group: GroupConfig, statuses: dict[str, Status]) -> Renderable
     return Group(t, Text(), members, *cmds)
 
 
-def group_state(group: GroupConfig, statuses: dict[str, Status]) -> State:
-    """Running only when every member is; starting if any is starting; stopped when all are."""
+def deployment_state(group: Deployment, statuses: dict[str, Status]) -> State:
+    """Running only when every model is; starting if any is starting; stopped when all are."""
     states = [
         statuses[m.name].state if m.name in statuses else State.STOPPED for m in group.members
     ]

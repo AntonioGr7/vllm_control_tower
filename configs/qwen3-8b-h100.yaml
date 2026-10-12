@@ -2,16 +2,18 @@
 #   vct estimate qwen3-8b-h100 --gpu H100
 name: qwen3-8b-h100
 description: Qwen3 8B on a single H100, 32k context
-model: Qwen/Qwen3-8B
 host: 0.0.0.0
-port: 8002
-vllm:
-  args:
-    served-model-name: qwen3-8b
-    tensor-parallel-size: 1
-    gpu-memory-utilization: 0.92
-    max-model-len: 32768
-    enable-prefix-caching: true
-estimate:
-  avg_prompt_tokens: 2048
-  avg_output_tokens: 512
+models:
+  - name: main
+    model: Qwen/Qwen3-8B
+    port: 8002
+    vllm:
+      args:
+        served-model-name: qwen3-8b
+        tensor-parallel-size: 1
+        gpu-memory-utilization: 0.92
+        max-model-len: 32768
+        enable-prefix-caching: true
+    estimate:
+      avg_prompt_tokens: 2048
+      avg_output_tokens: 512

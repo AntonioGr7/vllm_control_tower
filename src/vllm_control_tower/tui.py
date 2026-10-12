@@ -30,8 +30,8 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from . import ops
-from .config import GroupConfig, ServeConfig, load_catalog
-from .estimator import Estimate, GroupEstimate
+from .config import Deployment, ServeConfig, load_catalog
+from .estimator import DeploymentEstimate, Estimate
 from .hardware import GiB, GpuSpec, detect_gpus, known_gpu_names, lookup
 from .metrics import MetricsTracker
 from .model_info import ModelInfoError
@@ -41,19 +41,21 @@ from .render import (
     STATE_STYLE,
     bar,
     config_details,
+    deployment_details,
+    deployment_estimate_report,
+    deployment_state,
     estimate_report,
-    group_details,
-    group_estimate_report,
-    group_state,
 )
 
 TABS = ["overview", "estimate", "monitor", "logs"]
 LOCAL = "__local__"
 
 
-class ConfigItem(ListItem):
-    def __init__(self, cfg: ServeConfig, color: str | None = None) -> None:
-        super().__init__(classes="member" if cfg.group else None)
+class ModelItem(ListItem):
+    """A model row under a multi-model deployment."""
+
+    def __init__(self, cfg: ServeConfig, color: str, last: bool) -> None:
+        super().__init__(classes="member last" if last else "member")
         self.cfg = cfg
         self.color = color
         self.label = Static(self._text(State.STOPPED))
@@ -70,28 +72,23 @@ class ConfigItem(ListItem):
 
     def _text(self, state: State) -> Text:
         icon, style = STATE_STYLE[state]
-        if self.cfg.group:
-            t = Text("  ")
-            t.append("■ ", style=self.color or "grey50")
-            t.append(f"{icon} ", style=style)
-            t.append(self.cfg.short_name, style="bold")
-            t.append(f"\n      :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
-            return t
-        t = Text(f" {icon} ", style=style)
-        t.append(self.cfg.name, style="bold")
-        t.append(f"\n   :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
+        t = Text("  ")
+        t.append("■ ", style=self.color)
+        t.append(f"{icon} ", style=style)
+        t.append(self.cfg.short_name, style="bold")
+        t.append(f"\n      :{self.cfg.port}  {self.cfg.model.split('/')[-1]}", style="grey50")
         return t
 
 
-class GroupItem(ListItem):
-    def __init__(self, group: GroupConfig) -> None:
-        super().__init__(classes="group")
-        self.group = group
+class DeploymentItem(ListItem):
+    def __init__(self, dep: Deployment) -> None:
+        super().__init__(classes=None if dep.single else "group")
+        self.dep = dep
         self.label = Static(self._text(State.STOPPED))
 
     @property
     def entry_name(self) -> str:
-        return self.group.name
+        return self.dep.name
 
     def compose(self) -> ComposeResult:
         yield self.label
@@ -102,8 +99,12 @@ class GroupItem(ListItem):
     def _text(self, state: State) -> Text:
         icon, style = STATE_STYLE[state]
         t = Text(f" {icon} ", style=style)
-        t.append(self.group.name, style="bold")
-        t.append(f"\n   group · {len(self.group.members)} models", style="grey50")
+        t.append(self.dep.name, style="bold")
+        if self.dep.single:
+            m = self.dep.members[0]
+            t.append(f"\n   :{m.port}  {m.model.split('/')[-1]}", style="grey50")
+        else:
+            t.append(f"\n   {len(self.dep.members)} models", style="grey50")
         return t
 
 
@@ -294,14 +295,14 @@ class ControlTower(App):
         self.config_dir = config_dir
         self.runtime_dir = runtime_dir
         self.pm = ProcessManager(runtime_dir)
-        self.configs: list[ServeConfig] = []  # every runnable model, group members included
-        self.groups: list[GroupConfig] = []
-        self._group_jobs: dict[str, bool] = {}  # group name -> abort requested
+        self.deployments: list[Deployment] = []
+        self.servers: list[ServeConfig] = []  # every model across all deployments
+        self._jobs: dict[str, bool] = {}  # entry being started -> abort requested
         self.config_errors: list[str] = []
         self.selected: str | None = None
         self.statuses: dict[str, Status] = {}
         self.trackers: dict[str, MetricsTracker] = {}
-        self.estimates: dict[tuple[str, str], Estimate | GroupEstimate | str] = {}
+        self.estimates: dict[tuple[str, str], Estimate | DeploymentEstimate | str] = {}
         self.hardware = LOCAL
         self.local_gpus: list[GpuSpec] = []
         self.gpu_util: deque[float] = deque(maxlen=120)
@@ -316,7 +317,7 @@ class ControlTower(App):
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Label("CONFIGS", classes="section-title")
+                yield Label("DEPLOYMENTS", classes="section-title")
                 yield ListView(id="configs")
                 yield Label("GPU", classes="section-title")
                 yield Static(id="gpu-panel")
@@ -362,42 +363,37 @@ class ControlTower(App):
 
     def load(self) -> None:
         cat = load_catalog(self.config_dir)
-        self.configs = cat.configs
-        self.groups = cat.groups
+        self.deployments = cat.deployments
+        self.servers = cat.servers
         self.config_errors = [str(e) for e in cat.errors]
         lv = self.query_one("#configs", ListView)
         lv.clear()
         names: list[str] = []
-        for entry in cat.entries:
-            if isinstance(entry, GroupConfig):
-                lv.append(GroupItem(entry))
-                names.append(entry.name)
-                for i, m in enumerate(entry.members):
-                    item = ConfigItem(m, MEMBER_COLORS[i % len(MEMBER_COLORS)])
-                    if i == len(entry.members) - 1:
-                        item.add_class("last")
-                    lv.append(item)
-                    names.append(m.name)
-            else:
-                lv.append(ConfigItem(entry))
-                names.append(entry.name)
+        for dep in cat.deployments:
+            lv.append(DeploymentItem(dep))
+            names.append(dep.name)
+            if dep.single:
+                continue
+            for i, m in enumerate(dep.members):
+                color = MEMBER_COLORS[i % len(MEMBER_COLORS)]
+                lv.append(ModelItem(m, color, last=i == len(dep.members) - 1))
+                names.append(m.name)
         self.refresh_states()
         for err in self.config_errors:
             self.notify(err, title="Invalid config", severity="error", timeout=10)
         if not names:
             self.query_one("#overview-body", Static).update(
-                Text(f"No YAML configs found in {self.config_dir.resolve()}/", style="yellow")
+                Text(f"No deployments found in {self.config_dir.resolve()}/", style="yellow")
             )
             return
         index = names.index(self.selected) if self.selected in names else 0
         lv.index = index
         self.select(names[index], force=True)
 
-    def config(self, name: str | None) -> ServeConfig | None:
-        return next((c for c in self.configs if c.name == name), None)
-
-    def entry(self, name: str | None) -> ServeConfig | GroupConfig | None:
-        return next((g for g in self.groups if g.name == name), None) or self.config(name)
+    def entry(self, name: str | None) -> Deployment | ServeConfig | None:
+        """The selected row: a deployment, or one model of a multi-model deployment."""
+        dep = next((d for d in self.deployments if d.name == name), None)
+        return dep or next((m for m in self.servers if m.name == name), None)
 
     def select(self, name: str, force: bool = False) -> None:
         if name == self.selected and not force:
@@ -411,7 +407,7 @@ class ControlTower(App):
 
     @on(ListView.Highlighted, "#configs")
     def _highlighted(self, event: ListView.Highlighted) -> None:
-        if isinstance(event.item, (ConfigItem, GroupItem)):
+        if isinstance(event.item, (DeploymentItem, ModelItem)):
             self.select(event.item.entry_name)
 
     @on(ListView.Selected, "#configs")
@@ -423,8 +419,8 @@ class ControlTower(App):
     def render_overview(self) -> None:
         entry = self.entry(self.selected)
         body = self.query_one("#overview-body", Static)
-        if isinstance(entry, GroupConfig):
-            body.update(group_details(entry, self.statuses))
+        if isinstance(entry, Deployment):
+            body.update(deployment_details(entry, self.statuses))
         elif entry:
             body.update(config_details(entry, self.statuses.get(entry.name)))
 
@@ -448,16 +444,16 @@ class ControlTower(App):
             self.compute_estimate(entry, self.hardware)
         elif isinstance(result, str):
             body.update(Group(hint, Text(), Text(result, style="red")))
-        elif isinstance(result, GroupEstimate):
-            body.update(Group(hint, group_estimate_report(result)))
+        elif isinstance(result, DeploymentEstimate):
+            body.update(Group(hint, deployment_estimate_report(result)))
         else:
             body.update(Group(hint, estimate_report(result)))
 
     @work(thread=True, group="estimate")
-    def compute_estimate(self, entry: ServeConfig | GroupConfig, hardware: str) -> None:
+    def compute_estimate(self, entry: ServeConfig | Deployment, hardware: str) -> None:
         key = (entry.name, hardware)
         try:
-            result: Estimate | GroupEstimate | str = ops.estimate_entry(
+            result: Estimate | DeploymentEstimate | str = ops.estimate_entry(
                 entry,
                 self.pm,
                 runtime_dir=self.runtime_dir,
@@ -481,8 +477,8 @@ class ControlTower(App):
         members = ops.members(entry)
         trackers = [t for m in members if (t := self.trackers.get(m.name))]
         status = self.query_one("#monitor-status", Static)
-        if isinstance(entry, GroupConfig):
-            line = Text("Summed over members: ", style="grey62")
+        if len(members) > 1:
+            line = Text("Summed over models: ", style="grey62")
             for i, m in enumerate(members):
                 st = self.statuses.get(m.name)
                 icon, style = STATE_STYLE[st.state if st else State.STOPPED]
@@ -491,7 +487,7 @@ class ControlTower(App):
                 line.append(f"{icon}   ", style=style)
             status.update(line)
         else:
-            cfg = entry
+            cfg = members[0]
             st = self.statuses.get(cfg.name)
             tracker = self.trackers.get(cfg.name)
             if not st or st.state in (State.STOPPED, State.STALE):
@@ -569,7 +565,7 @@ class ControlTower(App):
 
     @work(thread=True, exclusive=True, group="poll")
     def poll(self) -> None:
-        statuses = {c.name: self.pm.status(c.name) for c in self.configs}
+        statuses = {c.name: self.pm.status(c.name) for c in self.servers}
         for name, st in statuses.items():
             if st.state in (State.RUNNING, State.STARTING, State.UNHEALTHY) and st.record:
                 tracker = self.trackers.get(name)
@@ -622,11 +618,11 @@ class ControlTower(App):
 
     def refresh_states(self) -> None:
         lv = self.query_one("#configs", ListView)
-        for item in lv.query(ConfigItem):
+        for item in lv.query(ModelItem):
             st = self.statuses.get(item.cfg.name)
             item.set_state(st.state if st else State.STOPPED)
-        for item in lv.query(GroupItem):
-            item.set_state(group_state(item.group, self.statuses))
+        for item in lv.query(DeploymentItem):
+            item.set_state(deployment_state(item.dep, self.statuses))
 
     def refresh_logs(self) -> None:
         entry = self.entry(self.selected)
@@ -634,10 +630,9 @@ class ControlTower(App):
             return
         log = self.query_one("#log-view", RichLog)
         members = ops.members(entry)
-        is_group = isinstance(entry, GroupConfig)
 
         def prefix(i: int, m: ServeConfig) -> Text:
-            if not is_group:
+            if len(members) == 1:
                 return Text()
             # Style only the span: a base style on the Text would bleed into the appended line.
             return Text.assemble((f"[{m.short_name}] ", MEMBER_COLORS[i % len(MEMBER_COLORS)]))
@@ -687,7 +682,7 @@ class ControlTower(App):
     def action_reload(self) -> None:
         self.estimates.clear()
         self.load()
-        self.notify(f"Loaded {len(self.configs)} models ({len(self.groups)} groups)")
+        self.notify(f"Loaded {len(self.deployments)} deployments ({len(self.servers)} models)")
 
     def action_hardware(self) -> None:
         def chosen(value: str | None) -> None:
@@ -699,45 +694,26 @@ class ControlTower(App):
         self.push_screen(HardwareScreen(detect_gpus(), self.hardware), chosen)
 
     def action_start(self) -> None:
+        """Start the selected deployment (models in order), or a single model row."""
         entry = self.entry(self.selected)
-        if isinstance(entry, GroupConfig):
-            self.start_group_action(entry)
+        if not entry:
             return
-        cfg = entry
-        if not cfg:
+        models = ops.members(entry)
+        if entry.name in self._jobs:
+            self.notify(f"{entry.name} is already starting", severity="warning")
             return
-        st = self.statuses.get(cfg.name)
-        if st and st.state in (State.RUNNING, State.STARTING, State.UNHEALTHY):
-            self.notify(f"{cfg.name} is already {st.state.value}", severity="warning")
+        if all(ops.is_up(self.pm, m.name) for m in models):
+            self.notify(f"{entry.name} is already running", severity="warning")
             return
-        try:
-            rec = self.pm.start(cfg)
-        except RuntimeError as e:
-            self.notify(str(e), title=f"Cannot start {cfg.name}", severity="error", timeout=10)
-            return
-        self.notify(f"pid {rec.pid} · loading {cfg.model}", title=f"Starting {cfg.name}")
-        self.statuses[cfg.name] = Status(cfg.name, State.STARTING, rec)
+        self._jobs[entry.name] = False
+        detail = " → ".join(m.short_name for m in models) if len(models) > 1 else models[0].model
+        self.notify(detail, title=f"Starting {entry.name}")
         self._log_key = None
         self.action_show_tab("logs")
-        self.poll()
-
-    def start_group_action(self, group: GroupConfig) -> None:
-        if group.name in self._group_jobs:
-            self.notify(f"{group.name} is already starting", severity="warning")
-            return
-        if all(ops.is_up(self.pm, m.name) for m in group.members):
-            self.notify(f"{group.name} is already running", severity="warning")
-            return
-        self._group_jobs[group.name] = False
-        self.notify(
-            " → ".join(m.short_name for m in group.members), title=f"Starting group {group.name}"
-        )
-        self._log_key = None
-        self.action_show_tab("logs")
-        self.run_group(group)
+        self.run_start(entry)
 
     @work(thread=True)
-    def run_group(self, group: GroupConfig) -> None:
+    def run_start(self, entry: Deployment | ServeConfig) -> None:
         def event(name: str, msg: str) -> None:
             error = msg.startswith("error")
             self.call_from_thread(
@@ -750,21 +726,21 @@ class ControlTower(App):
             self.call_from_thread(self.poll)
 
         try:
-            ok = ops.start_group(
+            ok = ops.start_deployment(
                 self.pm,
-                group,
+                entry,
                 on_event=event,
-                should_stop=lambda: self._group_jobs.get(group.name, True),
+                should_stop=lambda: self._jobs.get(entry.name, True),
             )
         finally:
-            aborted = self._group_jobs.pop(group.name, False)
+            aborted = self._jobs.pop(entry.name, False)
         if ok:
-            self.call_from_thread(self.notify, "all members healthy", title=f"{group.name} ready")
-        elif not aborted:
+            self.call_from_thread(self.notify, "ready to serve", title=entry.name)
+        elif not aborted and len(ops.members(entry)) > 1:
             self.call_from_thread(
                 self.notify,
-                "stopped at the failing member; press x to stop the rest",
-                title=f"{group.name} incomplete",
+                "stopped at the failing model; press x to stop the rest",
+                title=f"{entry.name} incomplete",
                 severity="warning",
                 timeout=10,
             )
@@ -774,25 +750,22 @@ class ControlTower(App):
         if not entry:
             return
         up = [m for m in ops.members(entry) if ops.is_up(self.pm, m.name)]
-        if not up and entry.name not in self._group_jobs:
+        if not up and entry.name not in self._jobs:
             self.notify(f"{entry.name} is not running", severity="warning")
             return
-        if isinstance(entry, GroupConfig):
-            detail = "\n".join(f"{m.short_name}: {m.model} on :{m.port}" for m in up)
-            message = f"Stop group {entry.name}?\n\n{detail}"
-        else:
-            message = f"Stop {entry.name}?\n\n{entry.model} on :{entry.port}"
+        detail = "\n".join(f"{m.model} on :{m.port}" for m in up or ops.members(entry))
+        message = f"Stop {entry.name}?\n\n{detail}"
 
         def confirmed(ok: bool | None) -> None:
             if ok:
-                if entry.name in self._group_jobs:
-                    self._group_jobs[entry.name] = True  # abort a group start in progress
+                if entry.name in self._jobs:
+                    self._jobs[entry.name] = True  # abort a start in progress
                 self.stop_servers(entry)
 
         self.push_screen(ConfirmScreen(message), confirmed)
 
     @work(thread=True)
-    def stop_servers(self, entry: ServeConfig | GroupConfig) -> None:
+    def stop_servers(self, entry: ServeConfig | Deployment) -> None:
         self.call_from_thread(self.notify, f"Sending SIGTERM to {entry.name}…", title="Stopping")
         results = ops.stop_entry(self.pm, entry)
         stopped = [n for n, was in results if was]

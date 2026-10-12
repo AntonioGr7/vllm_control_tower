@@ -2,18 +2,20 @@
 # On Ampere (sm86) vLLM runs FP8 weights through Marlin weight-only kernels.
 name: qwen3-0.6b-fp8
 description: Qwen3 0.6B FP8, longer context on a 4 GB GPU
-model: Qwen/Qwen3-0.6B-FP8
-port: 8001
 env:
   # FlashInfer JIT-compiles its sampler with the system nvcc; CUDA < 12.8 fails on
   # --compress-mode. Use vLLM's PyTorch sampler instead (no compilation needed).
   VLLM_USE_FLASHINFER_SAMPLER: "0"
-vllm:
-  args:
-    served-model-name: qwen3-0.6b-fp8
-    gpu-memory-utilization: 0.8
-    max-model-len: 8192
-    max-num-seqs: 16
-    kv-cache-dtype: auto
-  flags:
-    - enforce-eager
+models:
+  - name: main
+    model: Qwen/Qwen3-0.6B-FP8
+    port: 8001
+    vllm:
+      args:
+        served-model-name: qwen3-0.6b-fp8
+        gpu-memory-utilization: 0.8
+        max-model-len: 8192
+        max-num-seqs: 16
+        kv-cache-dtype: auto
+      flags:
+        - enforce-eager

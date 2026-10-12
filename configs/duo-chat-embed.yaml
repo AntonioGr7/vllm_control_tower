@@ -1,9 +1,9 @@
 # Two models on one GPU: a chat model and an embedding model for RAG.
 #
 # Every vLLM instance claims `gpu-memory-utilization × total VRAM` for itself, so on a
-# shared GPU the members' utilizations must add up to less than what is actually free
+# shared GPU the models' utilizations must add up to less than what is actually free
 # (on WSL/desktop the display already holds ~0.5 GB), and each instance also creates
-# its own ~0.2 GB CUDA context outside its budget. Members start in the order listed,
+# its own ~0.2 GB CUDA context outside its budget. Models start in the order listed,
 # each one after the previous is healthy, and stop in reverse order.
 #
 #   vct estimate duo-chat-embed     # checks the combined budget
@@ -12,7 +12,7 @@
 name: duo-chat-embed
 description: Qwen3 0.6B FP8 chat + BGE-small embeddings sharing a 4 GB GPU
 host: 127.0.0.1
-env:                      # shared by every member; a member's own env wins
+env:                      # shared by every model; a model's own env wins
   HF_TOKEN: ${HF_TOKEN}
   VLLM_LOGGING_LEVEL: INFO
   # FlashInfer JIT-compiles its sampler with the system nvcc; CUDA < 12.8 fails on

@@ -1,4 +1,7 @@
-"""Operations shared by the CLI and the TUI: estimating and starting/stopping configs or groups."""
+"""Operations shared by the CLI and the TUI: estimate, start and stop deployments.
+
+Everything takes an Entry: a whole deployment, or one of its models on its own.
+"""
 
 from __future__ import annotations
 
@@ -7,17 +10,17 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from .config import GroupConfig, ServeConfig
-from .estimator import Estimate, GroupEstimate, discount_running, estimate, estimate_group
+from .config import Deployment, ServeConfig
+from .estimator import DeploymentEstimate, Estimate, discount_running, estimate, estimate_deployment
 from .hardware import GpuSpec, detect_gpus, lookup
 from .model_info import ModelInfoError, get_model_info
 from .process import ProcessManager, State
 
-Entry = ServeConfig | GroupConfig
+Entry = Deployment | ServeConfig
 
 
 def members(entry: Entry) -> list[ServeConfig]:
-    return entry.members if isinstance(entry, GroupConfig) else [entry]
+    return entry.members if isinstance(entry, Deployment) else [entry]
 
 
 def is_up(pm: ProcessManager, name: str) -> bool:
@@ -27,7 +30,7 @@ def is_up(pm: ProcessManager, name: str) -> bool:
 def resolve_gpu(
     entry: Entry, pm: ProcessManager, gpu: str | None = None, num_gpus: int | None = None
 ) -> tuple[GpuSpec, int]:
-    """The GPU to estimate on. Local GPUs give back the VRAM this entry's own running servers hold."""
+    """The GPU to estimate on. Local GPUs give back the VRAM this entry's own running models hold."""
     if gpu:
         spec = lookup(gpu)
         if spec is None:
@@ -56,7 +59,7 @@ def estimate_entry(
     offline: bool = False,
     prompt_tokens: int | None = None,
     output_tokens: int | None = None,
-) -> Estimate | GroupEstimate:
+) -> Estimate | DeploymentEstimate:
     spec, n = resolve_gpu(entry, pm, gpu, num_gpus)
 
     def one(cfg: ServeConfig) -> Estimate:
@@ -73,7 +76,7 @@ def estimate_entry(
             results.append((cfg, one(cfg)))
         except ModelInfoError as e:
             results.append((cfg, str(e)))
-    return estimate_group(entry.name, results, spec, n)
+    return estimate_deployment(entry.name, results, spec, n)
 
 
 Progress = Callable[[str, str], None]  # (member name, message)
@@ -102,9 +105,9 @@ def wait_healthy(
     return pm.status(name).state
 
 
-def start_group(
+def start_deployment(
     pm: ProcessManager,
-    group: GroupConfig,
+    entry: Entry,
     *,
     timeout: float = 900,
     wait_last: bool = True,
@@ -112,13 +115,14 @@ def start_group(
     on_progress: Progress | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> bool:
-    """Start members in order, each after the previous one is healthy. Returns True on success.
+    """Start models in order, each after the previous one is healthy. Returns True on success.
 
-    vLLM sizes its KV cache from the free memory it sees while profiling, so members sharing
+    vLLM sizes its KV cache from the free memory it sees while profiling, so models sharing
     a GPU must not load at the same time.
     """
     emit = on_event or (lambda _n, _m: None)
-    for i, cfg in enumerate(group.members):
+    todo = members(entry)
+    for i, cfg in enumerate(todo):
         if is_up(pm, cfg.name):
             emit(cfg.name, "already running")
             continue
@@ -128,7 +132,7 @@ def start_group(
             emit(cfg.name, f"error: {e}")
             return False
         emit(cfg.name, f"started pid {rec.pid} on :{cfg.port}")
-        if i == len(group.members) - 1 and not wait_last:
+        if i == len(todo) - 1 and not wait_last:
             break
         state = wait_healthy(pm, cfg.name, timeout, on_progress, should_stop)
         if state is State.RUNNING:
@@ -144,5 +148,5 @@ def start_group(
 
 
 def stop_entry(pm: ProcessManager, entry: Entry, timeout: float = 30) -> list[tuple[str, bool]]:
-    """Stop a config, or a group's members in reverse start order."""
+    """Stop a model, or a deployment's models in reverse start order."""
     return [(cfg.name, pm.stop(cfg.name, timeout)) for cfg in reversed(members(entry))]

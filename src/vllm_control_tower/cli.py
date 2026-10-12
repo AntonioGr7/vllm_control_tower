@@ -12,19 +12,19 @@ from rich.table import Table
 
 from . import config as config_mod
 from . import ops
-from .config import GroupConfig, ServeConfig, find_entry, load_catalog
-from .estimator import GroupEstimate
+from .config import Deployment, ServeConfig, load_catalog
+from .estimator import DeploymentEstimate
 from .hardware import detect_gpus, known_gpu_names
 from .model_info import ModelInfoError
-from .process import ProcessManager, State
+from .process import ProcessManager
 from .render import (
     MEMBER_COLORS,
     config_details,
+    deployment_details,
+    deployment_estimate_report,
+    deployment_state,
     estimate_report,
     gpu_table,
-    group_details,
-    group_estimate_report,
-    group_state,
     state_badge,
 )
 
@@ -72,20 +72,26 @@ def main(
         tui()
 
 
-def _get(name: str) -> ServeConfig | GroupConfig:
+def _get(name: str) -> Deployment | ServeConfig:
+    """A deployment by name, one of its models as `deployment.model`, or a YAML path."""
     try:
-        return find_entry(name, ctx.config_dir)
-    except KeyError:
         cat = load_catalog(ctx.config_dir)
-        names = ", ".join(e.name for e in cat.entries) or "none"
-        console.print(f"[red]No config named {name!r} in {ctx.config_dir}[/] (available: {names})")
-        raise typer.Exit(1) from None
+        found = cat.deployment(name) or cat.server(name)
+        if found is None and Path(name).is_file():
+            found = config_mod.load_file(Path(name))
     except config_mod.ConfigError as e:
         console.print(f"[red]{e}[/]")
         raise typer.Exit(1) from None
+    if found is None:
+        names = ", ".join(d.name for d in cat.deployments) or "none"
+        console.print(
+            f"[red]No deployment named {name!r} in {ctx.config_dir}[/] (available: {names})"
+        )
+        raise typer.Exit(1)
+    return found
 
 
-def _statuses(entry: ServeConfig | GroupConfig) -> dict:
+def _statuses(entry: Deployment | ServeConfig) -> dict:
     pm = ctx.pm
     return {m.name: pm.status(m.name) for m in ops.members(entry)}
 
@@ -100,46 +106,38 @@ def tui() -> None:
 
 @app.command("list")
 def list_configs() -> None:
-    """List configs and groups with their state."""
+    """List deployments and their state."""
     cat = load_catalog(ctx.config_dir)
     t = Table(header_style="bold", box=None, padding=(0, 2))
     for col in ("name", "state", "model", "endpoint"):
         t.add_column(col, no_wrap=True)
-    for entry in cat.entries:
-        statuses = _statuses(entry)
-        if isinstance(entry, GroupConfig):
+    for dep in cat.deployments:
+        statuses = _statuses(dep)
+        state = state_badge(deployment_state(dep, statuses))
+        if dep.single:
+            m = dep.members[0]
+            t.add_row(f"[bold]{dep.name}[/]", state, m.model, m.base_url)
+            continue
+        t.add_row(f"[bold]{dep.name}[/]", state, f"[grey62]{len(dep.members)} models[/]", "")
+        for i, m in enumerate(dep.members):
+            color = MEMBER_COLORS[i % len(MEMBER_COLORS)]
             t.add_row(
-                f"[bold]{entry.name}[/] [grey62]group[/]",
-                state_badge(group_state(entry, statuses)),
-                f"{len(entry.members)} models",
-                "",
+                f"  [{color}]■[/] {m.short_name}",
+                state_badge(statuses[m.name].state),
+                m.model,
+                m.base_url,
             )
-            for i, m in enumerate(entry.members):
-                color = MEMBER_COLORS[i % len(MEMBER_COLORS)]
-                t.add_row(
-                    f"  [{color}]■[/] {m.name}",
-                    state_badge(statuses[m.name].state),
-                    m.model,
-                    m.base_url,
-                )
-        else:
-            t.add_row(
-                f"[bold]{entry.name}[/]",
-                state_badge(statuses[entry.name].state),
-                entry.model,
-                entry.base_url,
-            )
-    console.print(t if cat.entries else f"[yellow]No configs in {ctx.config_dir}/[/]")
+    console.print(t if cat.deployments else f"[yellow]No deployments in {ctx.config_dir}/[/]")
     for e in cat.errors:
         console.print(f"[red]✖ {e}[/]")
 
 
 @app.command()
 def show(name: str) -> None:
-    """Show a config (or group) and the exact vLLM command(s) it runs."""
+    """Show a deployment (or one of its models) and the exact vLLM commands."""
     entry = _get(name)
-    if isinstance(entry, GroupConfig):
-        console.print(group_details(entry, _statuses(entry)))
+    if isinstance(entry, Deployment):
+        console.print(deployment_details(entry, _statuses(entry)))
     else:
         console.print(config_details(entry, ctx.pm.status(entry.name)))
 
@@ -148,13 +146,12 @@ def show(name: str) -> None:
 def validate() -> None:
     """Validate every YAML file in the config folder."""
     cat = load_catalog(ctx.config_dir)
-    for entry in cat.entries:
-        kind = f" (group of {len(entry.members)})" if isinstance(entry, GroupConfig) else ""
-        console.print(f"[green]✓[/] {entry.path}{kind}")
-    errors = cat.errors
-    for e in errors:
+    for dep in cat.deployments:
+        n = len(dep.members)
+        console.print(f"[green]✓[/] {dep.path} [grey62]({n} model{'s' if n > 1 else ''})[/]")
+    for e in cat.errors:
         console.print(f"[red]✖ {e}[/]")
-    raise typer.Exit(1 if errors else 0)
+    raise typer.Exit(1 if cat.errors else 0)
 
 
 @app.command()
@@ -179,7 +176,7 @@ def estimate(
     ] = None,
     offline: Annotated[bool, typer.Option(help="Only use the local Hugging Face cache.")] = False,
 ) -> None:
-    """Estimate VRAM, KV cache capacity and tokens/s for a config or group."""
+    """Estimate VRAM, KV cache capacity and tokens/s for a deployment."""
     entry = _get(name)
     try:
         with console.status(f"Reading model metadata for {name}…"):
@@ -196,8 +193,8 @@ def estimate(
     except (ValueError, RuntimeError, ModelInfoError) as e:
         console.print(f"[red]{e}[/]")
         raise typer.Exit(1) from None
-    if isinstance(result, GroupEstimate):
-        console.print(group_estimate_report(result))
+    if isinstance(result, DeploymentEstimate):
+        console.print(deployment_estimate_report(result))
     else:
         console.print(estimate_report(result))
     raise typer.Exit(0 if result.fits else 2)
@@ -207,92 +204,63 @@ def estimate(
 def start(
     name: str,
     wait: Annotated[
-        bool, typer.Option("--wait/--no-wait", help="Block until /health answers.")
+        bool, typer.Option("--wait/--no-wait", help="Block until the last model is healthy.")
     ] = True,
-    timeout: Annotated[float, typer.Option(help="Seconds to wait for health.")] = 900,
+    timeout: Annotated[float, typer.Option(help="Seconds to wait for health, per model.")] = 900,
 ) -> None:
-    """Start serving a config in the background. Groups start member by member."""
+    """Start a deployment in the background, one model at a time."""
     entry = _get(name)
     pm = ctx.pm
-    if isinstance(entry, GroupConfig):
-        _start_group(entry, wait, timeout)
-        return
-    cfg = entry
-    try:
-        rec = pm.start(cfg)
-    except RuntimeError as e:
-        console.print(f"[red]{e}[/]")
-        raise typer.Exit(1) from None
-    console.print(f"[green]▶[/] started [bold]{cfg.name}[/] (pid {rec.pid}) → {cfg.base_url}/v1")
-    console.print(f"  logs: {rec.log_file}")
-    if not wait:
-        return
-    with console.status("Waiting for vLLM to load the model…") as status:
-        state = ops.wait_healthy(
-            pm, cfg.name, timeout, lambda _n, line: status.update(f"[grey62]{line[:120]}[/]")
+    models = ops.members(entry)
+    if len(models) > 1:
+        console.print(
+            f"Starting [bold]{entry.name}[/]: " + " → ".join(m.short_name for m in models)
         )
-    _report_health(cfg, state, timeout)
-
-
-def _report_health(cfg: ServeConfig, state: State, timeout: float) -> None:
-    pm = ctx.pm
-    if state is State.RUNNING:
-        console.print(f"[green]●[/] {cfg.name} is healthy → {cfg.base_url}/v1")
-    elif state in (State.STALE, State.STOPPED):
-        console.print(f"[red]✖ {cfg.name} exited during startup. Last log lines:[/]")
-        for line in pm.tail(cfg.name, 25):
-            console.print(f"  [grey62]{line}[/]", markup=False, highlight=False)
-        pm.pid_file(cfg.name).unlink(missing_ok=True)
-        raise typer.Exit(1)
-    else:
-        console.print(f"[yellow]Timed out after {timeout:.0f}s; {cfg.name} is still starting.[/]")
-
-
-def _start_group(group: GroupConfig, wait: bool, timeout: float) -> None:
-    pm = ctx.pm
-    console.print(
-        f"Starting group [bold]{group.name}[/]: " + " → ".join(m.short_name for m in group.members)
-    )
     failed: list[str] = []
     with console.status("") as status:
 
-        def event(name: str, msg: str) -> None:
+        def event(model: str, msg: str) -> None:
+            cfg = next(m for m in models if m.name == model)
             if msg.startswith("error"):
-                failed.append(name)
-                console.print(f"[red]✖[/] {name}: {msg.removeprefix('error: ')}")
+                failed.append(model)
+                console.print(f"[red]✖[/] {model}: {msg.removeprefix('error: ')}")
             elif msg == "healthy":
-                cfg = next(m for m in group.members if m.name == name)
-                console.print(f"[green]●[/] {name} is healthy → {cfg.base_url}/v1")
+                console.print(f"[green]●[/] {model} is healthy → {cfg.base_url}/v1")
             else:
-                console.print(f"[green]▶[/] {name}: {msg}")
-                status.update(f"Waiting for {name} to load…")
+                console.print(f"[green]▶[/] {model}: {msg}")
+                console.print(f"  logs: {pm.log_file(model)}", style="grey62")
+                status.update(f"Waiting for {model} to load…")
 
-        ok = ops.start_group(
+        ok = ops.start_deployment(
             pm,
-            group,
+            entry,
             timeout=timeout,
             wait_last=wait,
             on_event=event,
             on_progress=lambda n, line: status.update(f"[grey62]{n}: {line[:110]}[/]"),
         )
-    if not ok:
-        for name in failed:
-            console.print(f"[red]Last log lines of {name}:[/]")
-            for line in pm.tail(name, 25):
-                console.print(f"  [grey62]{line}[/]", markup=False, highlight=False)
+    if ok:
+        return
+    for model in failed:
+        console.print(f"[red]Last log lines of {model}:[/]")
+        for line in pm.tail(model, 25):
+            console.print(f"  [grey62]{line}[/]", markup=False, highlight=False)
+    if len(models) > 1 and any(ops.is_up(pm, m.name) for m in models):
         console.print(
-            f"[yellow]Group {group.name} is partially up; `vct stop {group.name}` stops the rest.[/]"
+            f"[yellow]{entry.name} is partially up; `vct stop {entry.name}` stops the rest.[/]"
         )
-        raise typer.Exit(1)
+    raise typer.Exit(1)
 
 
 @app.command()
 def stop(
-    name: Annotated[str | None, typer.Argument(help="Config to stop.")] = None,
-    all_: Annotated[bool, typer.Option("--all", help="Stop every running config.")] = False,
+    name: Annotated[
+        str | None, typer.Argument(help="Deployment (or deployment.model) to stop.")
+    ] = None,
+    all_: Annotated[bool, typer.Option("--all", help="Stop everything that is running.")] = False,
     timeout: Annotated[float, typer.Option(help="Seconds before SIGKILL.")] = 30,
 ) -> None:
-    """Stop a running config or group (SIGTERM, then SIGKILL after the timeout)."""
+    """Stop a deployment, models in reverse order (SIGTERM, then SIGKILL after the timeout)."""
     pm = ctx.pm
     if all_:
         names = [s.name for s in pm.running()]
@@ -338,17 +306,25 @@ def logs(
     lines: Annotated[int, typer.Option("--tail", "-n")] = 100,
     follow: Annotated[bool, typer.Option("--follow", "-f")] = False,
 ) -> None:
-    """Print (and optionally follow) a server's log."""
+    """Print (and optionally follow) the log of a deployment's model."""
     pm = ctx.pm
-    log = pm.log_file(name)
-    if not log.exists():
-        console.print(f"[yellow]No log for {name} at {log}[/]")
-        raise typer.Exit(1) from None
-    for line in pm.tail(name, lines):
-        print(line)
-    if not follow:
+    models = ops.members(_get(name))
+    if len(models) > 1 and follow:
+        names = ", ".join(m.name for m in models)
+        console.print(f"[yellow]{name} has {len(models)} models; follow one of: {names}[/]")
+        raise typer.Exit(1)
+    for m in models:
+        if len(models) > 1:
+            console.rule(m.name, style="grey50")
+        log = pm.log_file(m.name)
+        if not log.exists():
+            console.print(f"[yellow]No log for {m.name} yet ({log})[/]")
+            continue
+        for line in pm.tail(m.name, lines):
+            print(line)
+    if not follow or not pm.log_file(models[0].name).exists():
         return
-    with log.open() as f:
+    with pm.log_file(models[0].name).open() as f:
         f.seek(0, 2)
         try:
             while True:
