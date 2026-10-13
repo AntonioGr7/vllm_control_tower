@@ -209,7 +209,8 @@ def gpu_table(gpus: list[GpuSpec]) -> RenderableType:
         t.add_row(
             str(g.index),
             g.name,
-            f"{g.used_bytes / GiB:.1f}/{g.memory_bytes / GiB:.1f} GiB",
+            f"{g.used_bytes / GiB:.1f}/{g.memory_bytes / GiB:.1f} GiB"
+            + (" unified" if g.unified_memory else ""),
             bar(frac, 20, color),
             f"{g.utilization}%" if g.utilization is not None else "-",
             f"{g.temperature}°C" if g.temperature is not None else "-",

@@ -100,6 +100,10 @@ models:
 
 ![Deployment estimate: a chat model and an embedding model sharing one GPU, with the combined VRAM budget per model](docs/tui-group.png)
 
+### Unified memory (DGX Spark)
+
+On GPUs without dedicated VRAM, such as the DGX Spark's GB10, NVML does not report memory, so `vct` budgets against system RAM from `/proc/meminfo`. The page cache counts as free. `gpu-memory-utilization` is then a share of memory the OS also uses, so leave headroom. [configs/spark-chat-embed.yaml](configs/spark-chat-embed.yaml) is a starting point. Estimate it from any machine with `vct estimate spark-chat-embed --gpu GB10`.
+
 Runtime state lives in `.vct/`: PID files, per-server logs (the previous run is kept as `.log.prev`), and cached model metadata. Override the locations with `VCT_CONFIG_DIR` and `VCT_RUNTIME_DIR`.
 
 ## Benchmark: measured vs estimated

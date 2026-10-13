@@ -1,0 +1,46 @@
+# Chat + embeddings for RAG on a DGX Spark (GB10, 128 GB unified memory).
+#
+# The GPU allocates from the same RAM as the OS, so `gpu-memory-utilization` is a share
+# of system memory: keep the models' sum well below 1 (here 0.63) to leave the OS, page
+# cache and your own processes room. Decode speed is bound by the 273 GB/s memory
+# bandwidth, which is why the chat model is an MoE: ~3B of its 30B parameters are read
+# per token. CUDA graphs stay on (no enforce-eager): memory is plentiful here.
+#
+#   vct estimate spark-chat-embed             # on the Spark itself
+#   vct estimate spark-chat-embed --gpu GB10  # from any other machine
+#   vct start spark-chat-embed                # chat on :8020, embeddings on :8021
+name: spark-chat-embed
+description: Qwen3 30B-A3B FP8 chat + Qwen3 0.6B embeddings on a DGX Spark
+host: 127.0.0.1
+env:
+  HF_TOKEN: ${HF_TOKEN}
+  VLLM_LOGGING_LEVEL: INFO
+models:
+  - name: chat
+    model: Qwen/Qwen3-30B-A3B-FP8
+    port: 8020
+    vllm:
+      args:
+        served-model-name: qwen3-30b-a3b
+        gpu-memory-utilization: 0.55
+        max-model-len: 32768
+        max-num-seqs: 32
+        enable-prefix-caching: true   # RAG prompts share long system/context prefixes
+    estimate:
+      avg_prompt_tokens: 4096
+      avg_output_tokens: 512
+
+  - name: embed
+    model: Qwen/Qwen3-Embedding-0.6B   # decoder-based embedder, 1024-dim vectors
+    port: 8021
+    vllm:
+      args:
+        served-model-name: qwen3-embed
+        runner: pooling
+        gpu-memory-utilization: 0.08
+        max-model-len: 8192
+        max-num-seqs: 64
+        max-num-batched-tokens: 16384
+    estimate:
+      avg_prompt_tokens: 512
+      avg_output_tokens: 1

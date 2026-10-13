@@ -23,6 +23,8 @@ class GpuSpec:
     temperature: int | None = None
     power_w: float | None = None
     source: str = "table"
+    # CPU and GPU share system RAM (DGX Spark / GB10): memory comes from /proc/meminfo.
+    unified_memory: bool = False
 
     @property
     def free_bytes(self) -> int:
@@ -36,6 +38,7 @@ class GpuSpec:
 # name, memory GiB, bandwidth GB/s, dense 16-bit tensor TFLOPS, compute capability
 _KNOWN: list[tuple[str, float, float, float, tuple[int, int]]] = [
     ("B200", 180, 8000, 2250, (10, 0)),
+    ("GB10", 128, 273, 100, (12, 1)),  # DGX Spark, unified LPDDR5x; TFLOPS approximate
     ("H200", 141, 4800, 989, (9, 0)),
     ("H100 SXM", 80, 3350, 989, (9, 0)),
     ("H100 NVL", 94, 3900, 835, (9, 0)),
@@ -130,7 +133,14 @@ def _read_gpu(nv, i: int) -> GpuSpec:
     h = nv.nvmlDeviceGetHandleByIndex(i)
     name = nv.nvmlDeviceGetName(h)
     name = name.decode() if isinstance(name, bytes) else name
-    mem = nv.nvmlDeviceGetMemoryInfo(h)
+    # Unified-memory GPUs (GB10) have no dedicated VRAM and NVML reports it as unsupported;
+    # the GPU allocates from system RAM, so budget against that instead.
+    mem = _try(lambda: nv.nvmlDeviceGetMemoryInfo(h))
+    unified = mem is None or not mem.total
+    if unified:
+        total, used = _system_memory()
+    else:
+        total, used = mem.total, mem.used
     known = lookup(name)
     if i not in _static or None in _static[i]:
         cc = _try(lambda: tuple(nv.nvmlDeviceGetCudaComputeCapability(h)))
@@ -140,17 +150,29 @@ def _read_gpu(nv, i: int) -> GpuSpec:
     bandwidth, tflops, cc = _static[i]
     return GpuSpec(
         name=name,
-        memory_bytes=mem.total,
+        memory_bytes=total,
         bandwidth_gbs=bandwidth or (known.bandwidth_gbs if known else 300.0),
         tflops_16=tflops or 30.0,
         compute_capability=cc or (known.compute_capability if known else None),
         index=i,
-        used_bytes=mem.used,
+        used_bytes=used,
         utilization=_try(lambda: nv.nvmlDeviceGetUtilizationRates(h).gpu),
         temperature=_try(lambda: nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU)),
         power_w=_try(lambda: nv.nvmlDeviceGetPowerUsage(h) / 1000),
         source="nvml",
+        unified_memory=unified,
     )
+
+
+def _system_memory() -> tuple[int, int]:
+    """(total, used) system RAM from /proc/meminfo; page cache counts as free."""
+    info: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            info[key] = int(rest.split()[0]) * 1024  # values are in kB
+    total = info["MemTotal"]
+    return total, total - info.get("MemAvailable", info.get("MemFree", 0))
 
 
 def resolve_hardware(gpu: str | None = None, num_gpus: int | None = None) -> tuple[GpuSpec, int]:
