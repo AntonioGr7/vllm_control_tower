@@ -26,6 +26,8 @@ uv run vct list                  # deployments and their state
 uv run vct estimate qwen3-0.6b   # memory / KV cache / throughput estimate on the local GPU
 uv run vct estimate qwen3-8b-h100 --gpu H100          # ...or on hardware you don't have
 uv run vct start qwen3-0.6b      # serve in the background, wait for /health
+uv run vct bench                 # TUI in bench mode: deployments you start get benchmarked
+uv run vct bench qwen3-0.6b      # headless: start if needed, measure, compare, stop
 uv run vct status                # running servers + GPU usage
 uv run vct logs qwen3-0.6b -f    # a multi-model deployment needs the model: duo-chat-embed.chat
 uv run vct stop qwen3-0.6b       # or: vct stop --all
@@ -39,6 +41,7 @@ uv run vct stop qwen3-0.6b       # or: vct stop --all
 | `←` `→` / `1`–`4` | switch tab: Overview, Estimate, Monitor, Logs |
 | `s` / `enter` | serve the selection; a deployment starts its models in order |
 | `x` | stop it (asks for confirmation) |
+| `b` | benchmark the selection (it must be running) |
 | `h` | choose the GPU to estimate for |
 | `r` | reload deployments from disk |
 | `q` | quit (running servers keep running) |
@@ -99,6 +102,20 @@ models:
 
 Runtime state lives in `.vct/`: PID files, per-server logs (the previous run is kept as `.log.prev`), and cached model metadata. Override the locations with `VCT_CONFIG_DIR` and `VCT_RUNTIME_DIR`.
 
+## Benchmark: measured vs estimated
+
+`uv run vct bench` opens the same TUI in **bench mode**. Start a deployment with `s` as usual. As soon as all its models are healthy, vct benchmarks them one by one and shows the results at the top of the Estimate tab. The models keep running afterwards, and the Monitor tab shows the benchmark traffic live. In normal mode, `b` benchmarks whatever is selected and running.
+
+For each model the benchmark:
+
+1. sends a warm-up request, then streamed requests at the same batch sizes as the estimate (1, 2, 4, 8 … up to `--max-concurrency`, `max-num-seqs` and what vLLM's KV cache holds). Every request uses the deployment's prompt length and generates exactly `--output` tokens (default: the configured output length, at most 128). Embedding models (`runner: pooling`) get `/v1/embeddings` requests instead;
+2. reports measured tok/s, per-request speed and time to first token next to the estimate, plus the memory vLLM actually allocated (read from its startup log);
+3. saves the result under `.vct/bench/` and calibrates the throughput model for this GPU and mode (eager vs CUDA graphs). Later estimates on this GPU include the measured per-step overhead and say so.
+
+`vct bench <deployment>` does the same without the TUI: it starts the deployment if needed, prints the comparison and stops what it started (`--keep` leaves it running).
+
+`vct estimate` and the Estimate tab keep showing the last benchmark for each model, as long as its config hasn't changed since. Prompts are unique token sequences, so vLLM's prefix cache can't inflate the numbers. A benchmark loads the server for a minute or two, so don't run it against one that's serving real traffic.
+
 ## How the estimate works
 
 Model facts come from `config.json` and the safetensors headers. They are read from the local Hugging Face cache when available, otherwise fetched from the Hub (header bytes only, no weight download).
@@ -113,7 +130,7 @@ KV bytes per token = 2 × layers × kv_heads/tp × head_dim × kv dtype size
 
 The estimator handles GQA, MLA (DeepSeek), sliding-window layers, MoE, FP8 and pre-quantized checkpoints, and tensor and pipeline parallelism. It also warns when `gpu-memory-utilization` asks for more than is currently free. This check matters on desktops and WSL, where the display already holds some VRAM.
 
-**Throughput** uses a roofline model. Each decode step reads the weights plus the batch's KV cache from memory, or is limited by compute, whichever is slower, plus a fixed scheduling overhead. The effective batch is the number of average requests whose KV fits in the cache, capped at `max-num-seqs`. Treat the results as ±30% and benchmark before you rely on them.
+**Throughput** uses a roofline model. Each decode step reads the weights plus the batch's KV cache from memory, or is limited by compute, whichever is slower, plus a fixed scheduling overhead. The effective batch is the number of average requests whose KV fits in the cache, capped at `max-num-seqs`. Treat uncalibrated results as an upper bound: the model leaves out per-step costs like kernel launches and the Python scheduler loop, which can dominate small models, eager mode and WSL. Run `vct bench` once per GPU and mode to calibrate them.
 
 ## Develop
 

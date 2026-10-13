@@ -5,11 +5,14 @@ Everything takes an Entry: a whole deployment, or one of its models on its own.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import bench, calibration
+from .bench import ModelBench
 from .config import Deployment, ServeConfig
 from .estimator import DeploymentEstimate, Estimate, discount_running, estimate, estimate_deployment
 from .hardware import GpuSpec, detect_gpus, lookup
@@ -17,6 +20,10 @@ from .model_info import ModelInfoError, get_model_info
 from .process import ProcessManager, State
 
 Entry = Deployment | ServeConfig
+
+
+def is_eager(cfg: ServeConfig) -> bool:
+    return cfg.has_flag("enforce-eager") or bool(cfg.arg("enforce-eager", False))
 
 
 def members(entry: Entry) -> list[ServeConfig]:
@@ -59,13 +66,24 @@ def estimate_entry(
     offline: bool = False,
     prompt_tokens: int | None = None,
     output_tokens: int | None = None,
+    calibrated: bool = True,
 ) -> Estimate | DeploymentEstimate:
+    """Estimate a model or deployment. On the local GPU, `vct bench` calibration applies."""
     spec, n = resolve_gpu(entry, pm, gpu, num_gpus)
 
     def one(cfg: ServeConfig) -> Estimate:
         info = get_model_info(cfg.model, runtime_dir=runtime_dir, offline=offline)
+        cal = None
+        if calibrated and gpu is None:
+            cal = calibration.load(spec.name, is_eager(cfg), runtime_dir)
         return estimate(
-            cfg, info, spec, n, avg_prompt_tokens=prompt_tokens, avg_output_tokens=output_tokens
+            cfg,
+            info,
+            spec,
+            n,
+            avg_prompt_tokens=prompt_tokens,
+            avg_output_tokens=output_tokens,
+            calibration=cal,
         )
 
     if isinstance(entry, ServeConfig):
@@ -150,3 +168,61 @@ def start_deployment(
 def stop_entry(pm: ProcessManager, entry: Entry, timeout: float = 30) -> list[tuple[str, bool]]:
     """Stop a model, or a deployment's models in reverse start order."""
     return [(cfg.name, pm.stop(cfg.name, timeout)) for cfg in reversed(members(entry))]
+
+
+@dataclass
+class BenchOutcome:
+    result: ModelBench
+    raw: Estimate | None  # uncalibrated estimate for the same workload, for comparison
+    calibration: calibration.Calibration | None
+    path: Path
+    estimate_error: str | None = None
+
+
+def run_benchmark(
+    cfg: ServeConfig,
+    pm: ProcessManager,
+    *,
+    runtime_dir: Path,
+    prompt_tokens: int | None = None,
+    output_tokens: int | None = None,
+    max_concurrency: int = 16,
+    on_progress: Callable[[str], None] | None = None,
+) -> BenchOutcome:
+    """Benchmark one running model, save the result and update this GPU's calibration.
+
+    Raises RuntimeError or httpx.HTTPError when the benchmark itself fails.
+    """
+    p = prompt_tokens or cfg.estimate.avg_prompt_tokens
+    o = output_tokens or min(cfg.estimate.avg_output_tokens, 128)
+    raw: Estimate | None = None
+    estimate_error = None
+    try:
+        raw = estimate_entry(
+            cfg, pm, runtime_dir=runtime_dir, prompt_tokens=p, output_tokens=o, calibrated=False
+        )
+    except (ValueError, RuntimeError, ModelInfoError) as e:
+        estimate_error = str(e)
+    log_lines = pm.tail(cfg.name, 5000)
+    memory = bench.parse_memory(log_lines)
+    max_seqs = int(cfg.arg("max-num-seqs", raw.max_num_seqs if raw else 256))
+    concurrencies = bench.pick_concurrencies(
+        raw, max_seqs, memory.kv_tokens, p + o, max_concurrency
+    )
+    gpus = detect_gpus()
+    result = asyncio.run(
+        bench.run(
+            cfg,
+            concurrencies=concurrencies,
+            prompt_tokens=p,
+            output_tokens=o,
+            gpu=gpus[0].name if gpus else "unknown",
+            log_lines=log_lines,
+            on_progress=on_progress,
+        )
+    )
+    path = bench.save(result, runtime_dir)
+    cal = bench.fit_calibration(result, raw) if raw else None
+    if cal:
+        calibration.save(cal, runtime_dir)
+    return BenchOutcome(result, raw, cal, path, estimate_error)

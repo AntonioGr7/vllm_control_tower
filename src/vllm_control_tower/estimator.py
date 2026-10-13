@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
+from .calibration import Calibration
 from .config import ServeConfig
 from .hardware import GiB, GpuSpec
 from .model_info import ModelInfo
@@ -97,6 +98,7 @@ class Estimate:
     ttft_ms: float
     requests_per_s: float
     curve: list[ThroughputPoint] = field(default_factory=list)
+    calibrated: bool = False
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -197,6 +199,7 @@ def estimate(
     *,
     avg_prompt_tokens: int | None = None,
     avg_output_tokens: int | None = None,
+    calibration: Calibration | None = None,
 ) -> Estimate:
     warnings: list[str] = []
     errors: list[str] = []
@@ -322,6 +325,8 @@ def estimate(
         return (1 - expert_bytes_share) + expert_bytes_share * touched / e
 
     base_overhead = 0.0025 + (model.num_layers / pp * 0.00012 if enforce_eager else 0.0)
+    if calibration:
+        base_overhead += max(calibration.extra_for(model.num_layers // pp), 0.0)
     tp_overhead = 2 * model.num_layers * 25e-6 if tp > 1 else 0.0
 
     def step(batch: int) -> ThroughputPoint:
@@ -349,6 +354,15 @@ def estimate(
     cycle = output * at_batch.step_ms / 1e3 + effective_batch * prompt / prefill_tps
     rps = effective_batch / cycle if cycle else 0.0
 
+    if calibration:
+        notes.append(
+            f"throughput calibrated by `vct bench` on {calibration.source} "
+            f"({calibration.measured_at[:10]}): +{calibration.extra_for(model.num_layers // pp) * 1e3:.0f} ms per step"
+        )
+    else:
+        notes.append(
+            "throughput is a roofline upper bound; `vct bench` measures it and calibrates this GPU"
+        )
     if str(cfg.arg("runner", "")).lower() == "pooling":
         notes.append("pooling model: tokens/s figures assume generation; read them as prefill only")
     if gpu.source == "table":
@@ -390,6 +404,7 @@ def estimate(
         ttft_ms=ttft,
         requests_per_s=rps,
         curve=curve,
+        calibrated=calibration is not None,
         warnings=warnings,
         errors=errors,
         notes=notes,

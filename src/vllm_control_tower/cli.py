@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -16,15 +17,17 @@ from .config import Deployment, ServeConfig, load_catalog
 from .estimator import DeploymentEstimate
 from .hardware import detect_gpus, known_gpu_names
 from .model_info import ModelInfoError
-from .process import ProcessManager
+from .process import ProcessManager, State
 from .render import (
     MEMBER_COLORS,
+    bench_report,
     config_details,
     deployment_details,
     deployment_estimate_report,
     deployment_state,
     estimate_report,
     gpu_table,
+    measured_sections,
     state_badge,
 )
 
@@ -192,8 +195,13 @@ def estimate(
         raise typer.Exit(1) from None
     if isinstance(result, DeploymentEstimate):
         console.print(deployment_estimate_report(result))
+        pairs = result.members
     else:
         console.print(estimate_report(result))
+        pairs = [(entry, result)]
+    if gpu is None:  # measurements only describe the local GPU
+        for section in measured_sections(pairs, ctx.runtime_dir):
+            console.print(section)
     raise typer.Exit(0 if result.fits else 2)
 
 
@@ -206,7 +214,12 @@ def start(
     timeout: Annotated[float, typer.Option(help="Seconds to wait for health, per model.")] = 900,
 ) -> None:
     """Start a deployment in the background, one model at a time."""
-    entry = _get(name)
+    if not _start(_get(name), wait, timeout):
+        raise typer.Exit(1)
+
+
+def _start(entry: Deployment | ServeConfig, wait: bool, timeout: float) -> bool:
+    """Start models in order with progress output. Returns True when all came up."""
     pm = ctx.pm
     models = ops.members(entry)
     if len(models) > 1:
@@ -223,6 +236,8 @@ def start(
                 console.print(f"[red]✖[/] {model}: {msg.removeprefix('error: ')}")
             elif msg == "healthy":
                 console.print(f"[green]●[/] {model} is healthy → {cfg.base_url}/v1")
+            elif msg == "already running":
+                console.print(f"[green]●[/] {model} is already running")
             else:
                 console.print(f"[green]▶[/] {model}: {msg}")
                 console.print(f"  logs: {pm.log_file(model)}", style="grey62")
@@ -237,7 +252,7 @@ def start(
             on_progress=lambda n, line: status.update(f"[grey62]{n}: {line[:110]}[/]"),
         )
     if ok:
-        return
+        return True
     for model in failed:
         console.print(f"[red]Last log lines of {model}:[/]")
         for line in pm.tail(model, 25):
@@ -246,7 +261,113 @@ def start(
         console.print(
             f"[yellow]{entry.name} is partially up; `vct stop {entry.name}` stops the rest.[/]"
         )
-    raise typer.Exit(1)
+    return False
+
+
+@app.command()
+def bench(
+    name: Annotated[
+        str | None,
+        typer.Argument(
+            help="Deployment (or deployment.model). Omit to open the TUI in bench mode."
+        ),
+    ] = None,
+    keep: Annotated[
+        bool,
+        typer.Option("--keep", help="Headless: leave models running if bench had to start them."),
+    ] = False,
+    prompt_tokens: Annotated[
+        int | None, typer.Option("--prompt", help="Prompt tokens per request.")
+    ] = None,
+    output_tokens: Annotated[
+        int | None, typer.Option("--output", help="Generated tokens per request (default ≤128).")
+    ] = None,
+    max_concurrency: Annotated[
+        int, typer.Option(help="Highest number of concurrent requests to try.")
+    ] = 16,
+    timeout: Annotated[float, typer.Option(help="Seconds to wait for each model to start.")] = 900,
+) -> None:
+    """Benchmark deployments right after they start.
+
+    Without a name, opens the TUI in bench mode: every deployment you start there is
+    benchmarked as soon as its models are healthy. With a name, runs headless: starts the
+    deployment if needed, measures it, prints the comparison and stops what it started.
+    Results are saved and calibrate future estimates for this GPU.
+    """
+    if name is None:
+        from .tui import ControlTower
+
+        ControlTower(
+            ctx.config_dir,
+            ctx.runtime_dir,
+            bench_options={
+                "prompt_tokens": prompt_tokens,
+                "output_tokens": output_tokens,
+                "max_concurrency": max_concurrency,
+            },
+        ).run()
+        return
+    entry = _get(name)
+    pm = ctx.pm
+    models = ops.members(entry)
+    started = [m for m in models if not ops.is_up(pm, m.name)]
+    if started and not _start(entry, wait=True, timeout=timeout):
+        _stop_models(started, keep)
+        raise typer.Exit(1)
+    try:
+        for cfg in models:
+            if ops.wait_healthy(pm, cfg.name, timeout) is not State.RUNNING:
+                console.print(f"[red]✖ {cfg.name} is not healthy; skipping[/]")
+                continue
+            _bench_model(cfg, prompt_tokens, output_tokens, max_concurrency)
+    finally:
+        _stop_models(started, keep)
+
+
+def _bench_model(
+    cfg: ServeConfig, prompt_tokens: int | None, output_tokens: int | None, cap: int
+) -> None:
+    console.rule(f"[bold]{cfg.name}[/]")
+    with console.status("") as status:
+        try:
+            out = ops.run_benchmark(
+                cfg,
+                ctx.pm,
+                runtime_dir=ctx.runtime_dir,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                max_concurrency=cap,
+                on_progress=lambda msg: status.update(f"{cfg.name}: {msg}…"),
+            )
+        except (RuntimeError, httpx.HTTPError) as e:
+            console.print(f"[red]✖ benchmark of {cfg.name} failed: {e}[/]")
+            return
+    if out.estimate_error:
+        console.print(f"[yellow]No estimate to compare with: {out.estimate_error}[/]")
+    console.print(bench_report(out.result, out.raw))
+    console.print(f"  saved {out.path}", style="grey62")
+    if out.calibration:
+        cal = out.calibration
+        mode = "eager" if cal.eager else "CUDA graphs"
+        console.print(
+            f"  calibrated {cal.gpu} ({mode}): +{cal.extra_step_s * 1e3:.0f} ms per decode step "
+            "in future estimates",
+            style="grey62",
+        )
+
+
+def _stop_models(models: list[ServeConfig], keep: bool) -> None:
+    if not models:
+        return
+    if keep:
+        console.print(f"[grey62]left running: {', '.join(m.name for m in models)}[/]")
+        return
+    for m in reversed(models):
+        with console.status(f"Stopping {m.name}…"):
+            ctx.pm.stop(m.name)
+        console.print(
+            f"[red]■[/] stopped {m.name} [grey62](started by bench; --keep leaves it up)[/]"
+        )
 
 
 @app.command()

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .bench import ModelBench, config_hash
+from .bench import load as load_bench
 from .config import Deployment, ServeConfig
 from .estimator import DeploymentEstimate, Estimate, device_set
 from .hardware import GiB, GpuSpec
@@ -402,3 +406,114 @@ def deployment_state(group: Deployment, statuses: dict[str, Status]) -> State:
     if any(s is State.STALE for s in states):
         return State.STALE
     return State.STOPPED
+
+
+def _ratio(measured: float | None, estimated: float | None) -> Text:
+    if not measured or not estimated:
+        return Text("–", style="grey50")
+    r = measured / estimated
+    style = "green" if 0.8 <= r <= 1.25 else "yellow" if 0.5 <= r <= 2 else "red"
+    return Text(f"{r:.2f}×", style=style)
+
+
+def bench_report(bench: ModelBench, est: Estimate | None) -> RenderableType:
+    """Measured numbers from `vct bench`, next to the estimate when one is given."""
+    mode = "eager" if bench.eager else "CUDA graphs"
+    head = Text.assemble(
+        ("measured ", "grey62"),
+        bench.measured_at.replace("T", " ")[:16],
+        ("  on ", "grey62"),
+        bench.gpu,
+        (f" ({mode})", "grey62"),
+    )
+    if bench.kind == "generate":
+        head.append(f"   {bench.prompt_tokens} in / {bench.output_tokens} out", style="grey62")
+    parts: list[RenderableType] = [head, Text()]
+
+    m = bench.memory
+    if est and any(v is not None for v in (m.weights_gib, m.kv_tokens)):
+        mem = Table(box=None, padding=(0, 2), header_style="bold")
+        for col in ("memory", "estimated", "vLLM", "ratio"):
+            mem.add_column(col, justify="left" if col == "memory" else "right", no_wrap=True)
+        rows = [
+            ("weights", est.weight_bytes / GiB, m.weights_gib, "{:.2f} GiB"),
+            ("KV cache", max(est.kv_cache_bytes, 0) / GiB, m.kv_cache_gib, "{:.2f} GiB"),
+            ("KV tokens", est.kv_capacity_tokens, m.kv_tokens, "{:,.0f}"),
+        ]
+        for label, e, v, fmt in rows:
+            if v is not None:
+                mem.add_row(label, fmt.format(e), fmt.format(v), _ratio(v, e))
+        parts += [mem, Text()]
+
+    t = Table(box=None, padding=(0, 2), header_style="bold")
+    if bench.kind == "embed":
+        for col in ("conc.", "embeddings/s", "prompt tok/s", "latency"):
+            t.add_column(col, justify="right", no_wrap=True)
+        for s in bench.scenarios:
+            t.add_row(
+                str(s.concurrency),
+                f"{s.items_per_s:,.1f}",
+                f"{s.agg_tps:,.0f}",
+                f"{s.ttft_ms:,.0f} ms",
+            )
+    else:
+        t.padding = (0, 1)
+        for col in (
+            "conc.",
+            "tok/s est",
+            "measured",
+            "ratio",
+            "seq est",
+            "seq",
+            "TTFT est",
+            "TTFT",
+        ):
+            t.add_column(col, justify="right", no_wrap=True)
+        points = {p.batch: p for p in est.curve} if est else {}
+        for s in bench.scenarios:
+            p = points.get(s.concurrency)
+            t.add_row(
+                str(s.concurrency),
+                f"{p.tokens_per_s:,.0f}" if p else "–",
+                Text(f"{s.agg_tps:,.1f}", style="bold"),
+                _ratio(s.agg_tps, p.tokens_per_s if p else None),
+                f"{p.per_seq_tokens_per_s:,.1f}" if p else "–",
+                f"{s.per_seq_tps:,.1f}",
+                f"{est.ttft_ms:,.0f} ms" if est and s.concurrency == 1 else "",
+                f"{s.ttft_ms:,.0f} ms",
+            )
+    parts.append(t)
+    failed = sum(s.errors for s in bench.scenarios)
+    if failed:
+        parts += [
+            Text(),
+            Text(f"⚠ {failed} request(s) failed during the benchmark", style="yellow"),
+        ]
+    if est and est.calibrated:
+        parts += [
+            Text(),
+            Text("estimates include this GPU's calibration", style="grey62"),
+        ]
+    return Panel(Group(*parts), title=f" {bench.model} · benchmark ", border_style="cyan")
+
+
+def measured_sections(
+    pairs: list[tuple[ServeConfig, Estimate | str]], runtime_dir: Path
+) -> list[RenderableType]:
+    """Saved `vct bench` results for these models, when taken with their current config."""
+    out: list[RenderableType] = []
+    for cfg, est in pairs:
+        result = load_bench(cfg.name, runtime_dir)
+        if result is None:
+            continue
+        if result.config_hash != config_hash(cfg):
+            out.append(
+                Text(
+                    f"{cfg.name}: last benchmark was taken with a different config; "
+                    f"run `vct bench {cfg.name}` again",
+                    style="grey62",
+                )
+            )
+            continue
+        out.append(bench_report(result, est if isinstance(est, Estimate) else None))
+    return out

@@ -45,6 +45,7 @@ from .render import (
     deployment_estimate_report,
     deployment_state,
     estimate_report,
+    measured_sections,
 )
 
 TABS = ["overview", "estimate", "monitor", "logs"]
@@ -262,6 +263,7 @@ class ControlTower(App):
     .card-value { height: 1; }
     .card Chart { margin-top: 1; }
     #monitor-status { padding: 1 0 0 0; color: $text-muted; }
+    #bench-status { height: auto; }
     #log-view { height: 1fr; }
     ConfirmScreen, HardwareScreen { align: center middle; }
     #dialog { width: 60; height: auto; border: thick $error; background: $surface; padding: 1 2; }
@@ -277,6 +279,7 @@ class ControlTower(App):
         Binding("x", "stop", "Stop"),
         Binding("e", "show_tab('estimate')", "Estimate"),
         Binding("h", "hardware", "Hardware"),
+        Binding("b", "bench", "Bench"),
         Binding("r", "reload", "Reload"),
         Binding("left", "tab(-1)", "◀ Tab", show=False),
         Binding("right", "tab(1)", "Tab ▶", show=False),
@@ -287,10 +290,16 @@ class ControlTower(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, config_dir: Path, runtime_dir: Path) -> None:
+    def __init__(
+        self, config_dir: Path, runtime_dir: Path, bench_options: dict | None = None
+    ) -> None:
         super().__init__()
         self.config_dir = config_dir
         self.runtime_dir = runtime_dir
+        # Bench mode (`vct bench`): deployments are benchmarked as soon as they are up.
+        self.bench_mode = bench_options is not None
+        self.bench_options = {k: v for k, v in (bench_options or {}).items() if v is not None}
+        self._benching: set[str] = set()
         self.pm = ProcessManager(runtime_dir)
         self.deployments: list[Deployment] = []
         self.servers: list[ServeConfig] = []  # every model across all deployments
@@ -322,7 +331,7 @@ class ControlTower(App):
                 with TabPane("Overview", id="overview"):
                     yield VerticalScroll(Static(id="overview-body"))
                 with TabPane("Estimate", id="estimate"):
-                    yield VerticalScroll(Static(id="estimate-body"))
+                    yield VerticalScroll(Static(id="bench-status"), Static(id="estimate-body"))
                 with TabPane("Monitor", id="monitor"):
                     with VerticalScroll():
                         yield Static(id="monitor-status")
@@ -347,6 +356,13 @@ class ControlTower(App):
 
     def on_mount(self) -> None:
         self.sub_title = str(self.config_dir.resolve())
+        if self.bench_mode:
+            self.sub_title += " · bench mode"
+            self.notify(
+                "Every deployment you start is benchmarked once its models are up.",
+                title="Bench mode",
+                timeout=8,
+            )
         self.load()
         self.set_interval(2.0, self.poll)
         self.set_interval(1.0, self.refresh_logs)
@@ -439,10 +455,14 @@ class ControlTower(App):
             self.compute_estimate(entry, self.hardware)
         elif isinstance(result, str):
             body.update(Group(hint, Text(), Text(result, style="red")))
-        elif isinstance(result, DeploymentEstimate):
-            body.update(Group(hint, deployment_estimate_report(result)))
         else:
-            body.update(Group(hint, estimate_report(result)))
+            if isinstance(result, DeploymentEstimate):
+                report, pairs = deployment_estimate_report(result), result.members
+            else:
+                report, pairs = estimate_report(result), [(entry, result)]
+            measured = measured_sections(pairs, self.runtime_dir) if self.hardware == LOCAL else []
+            # Measurements first: after a benchmark they are what you came to see.
+            body.update(Group(hint, *measured, report))
 
     @work(thread=True, group="estimate")
     def compute_estimate(self, entry: ServeConfig | Deployment, hardware: str) -> None:
@@ -731,6 +751,8 @@ class ControlTower(App):
             aborted = self._jobs.pop(entry.name, False)
         if ok:
             self.call_from_thread(self.notify, "ready to serve", title=entry.name)
+            if self.bench_mode:
+                self._benchmark(entry)
         elif not aborted and len(ops.members(entry)) > 1:
             self.call_from_thread(
                 self.notify,
@@ -739,6 +761,91 @@ class ControlTower(App):
                 severity="warning",
                 timeout=10,
             )
+
+    # ---- benchmark -------------------------------------------------------------
+
+    def action_bench(self) -> None:
+        """Benchmark the selected deployment or model; everything in it must be running."""
+        entry = self.entry(self.selected)
+        if not entry:
+            return
+        models = ops.members(entry)
+        down = [m.short_name for m in models if self._state(m.name) is not State.RUNNING]
+        if down:
+            hint = (
+                "start it first (s)"
+                if not self.bench_mode
+                else "press s: it is benchmarked once up"
+            )
+            self.notify(
+                f"not running: {', '.join(down)}; {hint}", title="Bench", severity="warning"
+            )
+            return
+        if any(m.name in self._benching for m in models):
+            self.notify(f"{entry.name} is already being benchmarked", severity="warning")
+            return
+        self.run_bench(entry)
+
+    def _state(self, name: str) -> State:
+        st = self.statuses.get(name)
+        return st.state if st else State.STOPPED
+
+    @work(thread=True)
+    def run_bench(self, entry: Deployment | ServeConfig) -> None:
+        self._benchmark(entry)
+
+    def _benchmark(self, entry: Deployment | ServeConfig) -> None:
+        """Runs in a worker thread: benchmark each model in turn, then show the results."""
+        models = [m for m in ops.members(entry) if m.name not in self._benching]
+        self._benching.update(m.name for m in models)
+        self.call_from_thread(self.action_show_tab, "estimate")
+        try:
+            for i, cfg in enumerate(models, 1):
+                step = f"[{i}/{len(models)}] " if len(models) > 1 else ""
+
+                def progress(msg: str, cfg: ServeConfig = cfg, step: str = step) -> None:
+                    self.call_from_thread(
+                        self._bench_status,
+                        Text.assemble(
+                            ("⏱ benchmarking ", "bold cyan"),
+                            f"{step}{cfg.name}: {msg}… ",
+                            ("(watch it live in the Monitor tab)", "grey50"),
+                        ),
+                    )
+
+                progress("starting")
+                try:
+                    out = ops.run_benchmark(
+                        cfg, self.pm, runtime_dir=self.runtime_dir, on_progress=progress,
+                        **self.bench_options,
+                    )  # fmt: skip
+                except (RuntimeError, httpx.HTTPError) as e:
+                    self.call_from_thread(
+                        self.notify, str(e), title=f"Benchmark of {cfg.name} failed",
+                        severity="error", timeout=10,
+                    )  # fmt: skip
+                    continue
+                single = out.result.scenario(1)
+                summary = f"{single.agg_tps:.1f} tok/s single stream" if single else "done"
+                if out.result.kind == "embed" and single:
+                    summary = f"{single.items_per_s:.1f} embeddings/s single request"
+                if out.calibration:
+                    summary += f" · calibrated +{out.calibration.extra_step_s * 1e3:.0f} ms/step"
+                self.call_from_thread(self.notify, summary, title=f"Benchmarked {cfg.name}")
+        finally:
+            self._benching.difference_update(m.name for m in models)
+            self.call_from_thread(self._bench_done)
+
+    def _bench_status(self, text: Text | str) -> None:
+        self.query_one("#bench-status", Static).update(text)
+
+    def _bench_done(self) -> None:
+        self._bench_status("")
+        self.query_one("#estimate-body", Static).parent.scroll_home(animate=False)
+        # Calibration changed what local estimates should say.
+        for key in [k for k in self.estimates if k[1] == LOCAL]:
+            del self.estimates[key]
+        self.render_estimate()
 
     def action_stop(self) -> None:
         entry = self.entry(self.selected)
