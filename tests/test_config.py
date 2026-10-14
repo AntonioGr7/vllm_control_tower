@@ -55,6 +55,71 @@ def test_single_model_deployment_and_command(write_config, monkeypatch):
     ]  # fmt: skip
 
 
+def test_docker_command(write_config, monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_TOKEN", "secret")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    write_config(
+        "spark",
+        {
+            "env": {"HF_TOKEN": "${MY_TOKEN}", "HF_HOME": "/elsewhere"},
+            "models": [
+                {
+                    "name": "chat",
+                    "model": "nvidia/Qwen3.8-27B-NVFP4",
+                    "port": 8030,
+                    "vllm": {
+                        "image": "vllm/vllm-openai:qwen38",
+                        "args": {"max-model-len": 4096},
+                        "docker": {"executable": "/usr/bin/docker", "args": ["--shm-size", "16g"]},
+                    },
+                },
+                {
+                    "name": "local weights",
+                    "model": "/models/embed",
+                    "port": 8031,
+                    "vllm": {"image": "nvcr.io/nvidia/vllm:26.05-py3"},
+                },
+            ],
+        },
+    )
+    chat, local = load_catalog(write_config.dir).deployments[0].members
+    assert chat.container == "vct-spark.chat"
+    assert chat.command() == [
+        "/usr/bin/docker", "run", "--rm", "--init",
+        "--name", "vct-spark.chat", "--gpus", "all", "--ipc", "host", "--network", "host",
+        "-v", "/elsewhere:/root/.cache/huggingface",  # HF_HOME from `env:` wins
+        "-e", "PYTHONUNBUFFERED=1", "-e", "HF_TOKEN",  # names only: no secrets in the log
+        "--shm-size", "16g",
+        "--entrypoint", "vllm", "vllm/vllm-openai:qwen38",
+        "serve", "nvidia/Qwen3.8-27B-NVFP4", "--host", "127.0.0.1", "--port", "8030",
+        "--max-model-len", "4096",
+    ]  # fmt: skip
+    assert chat.resolved_env()["HF_TOKEN"] == "secret"  # docker reads it from its environment
+
+    cmd = local.command()
+    assert local.container == "vct-spark.local-weights"
+    assert cmd[0].endswith("docker") and cmd[1] == "run"  # resolved on PATH, like vllm
+    assert "/models/embed:/models/embed:ro" in cmd  # local weights are visible inside
+    assert "/elsewhere:/root/.cache/huggingface" in cmd
+    assert cmd[cmd.index("--entrypoint") :][:3] == [
+        "--entrypoint",
+        "vllm",
+        "nvcr.io/nvidia/vllm:26.05-py3",
+    ]
+
+
+def test_hf_cache_defaults(monkeypatch, tmp_path):
+    from vllm_control_tower.config import ServeConfig
+
+    cfg = ServeConfig(name="x", model="m", vllm={"image": "img"})
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert cfg.hf_cache() == tmp_path / ".cache/huggingface"
+    monkeypatch.setenv("HF_HOME", "/hf")
+    assert str(cfg.hf_cache()) == "/hf"
+    assert ServeConfig(name="y", model="m").container is None
+
+
 def test_invalid_and_duplicate_deployments(write_config):
     write_config("good", {"name": "dup", **_single("a")})
     write_config("also", {"name": "dup", **_single("b")})

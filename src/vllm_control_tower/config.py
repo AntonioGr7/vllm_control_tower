@@ -26,8 +26,25 @@ DEFAULT_RUNTIME_DIR = Path(os.environ.get("VCT_RUNTIME_DIR", ".vct"))
 _ENV_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
+CONTAINER_HF_HOME = "/root/.cache/huggingface"
+
+
+class DockerSection(BaseModel):
+    """How to run vLLM inside a container image (used when `vllm.image` is set)."""
+
+    executable: str = "docker"
+    # Host Hugging Face cache mounted into the container; defaults to $HF_HOME or
+    # ~/.cache/huggingface, the same cache the estimator reads model metadata from.
+    hf_cache: str | None = None
+    # Raw `docker run` options appended verbatim, e.g. ["-v", "/data:/data"].
+    args: list[str] = Field(default_factory=list)
+
+
 class VllmSection(BaseModel):
     executable: str = "vllm"
+    # Run `vllm serve` inside this container image instead of a local executable.
+    image: str | None = None
+    docker: DockerSection = Field(default_factory=DockerSection)
     # Any `vllm serve` option, written with or without leading dashes.
     args: dict[str, Any] = Field(default_factory=dict)
     # Boolean switches such as `enforce-eager`.
@@ -86,8 +103,43 @@ class ServeConfig(BaseModel):
     def resolved_env(self) -> dict[str, str]:
         return {k: _expand(str(v)) for k, v in self.env.items()}
 
+    @property
+    def container(self) -> str | None:
+        """Docker container name, when the model runs from an image."""
+        if not self.vllm.image:
+            return None
+        return "vct-" + re.sub(r"[^A-Za-z0-9_.-]", "-", self.name)
+
+    def hf_cache(self) -> Path:
+        explicit = self.vllm.docker.hf_cache or self.resolved_env().get("HF_HOME")
+        return Path(explicit or os.environ.get("HF_HOME") or "~/.cache/huggingface").expanduser()
+
     def command(self) -> list[str]:
-        cmd = [resolve_executable(self.vllm.executable), "serve", self.model]
+        if not self.vllm.image:
+            return [resolve_executable(self.vllm.executable), *self.serve_args()]
+        docker = self.vllm.docker
+        # Host networking keeps --host/--port, the health check and the port probe
+        # identical to a local process; --ipc=host gives PyTorch enough shared memory.
+        # --init: vLLM isn't PID 1, so `docker stop` reaches it as a normal SIGTERM.
+        cmd = [resolve_executable(docker.executable), "run", "--rm", "--init"]
+        cmd += ["--name", self.container, "--gpus", "all", "--ipc", "host", "--network", "host"]
+        cmd += ["-v", f"{self.hf_cache()}:{CONTAINER_HF_HOME}"]
+        if os.path.isabs(self.model):
+            cmd += ["-v", f"{self.model}:{self.model}:ro"]
+        # Values stay out of the command line (and the log): docker reads them from its
+        # own environment, which the process manager fills from `env:`.
+        cmd += ["-e", "PYTHONUNBUFFERED=1"]
+        for key in self.env:
+            if key != "HF_HOME":  # a host path; the cache is mounted at the image default
+                cmd += ["-e", key]
+        cmd += [_expand(a) for a in docker.args]
+        # NGC images have no entrypoint and vllm/vllm-openai's is `vllm serve`; pin it.
+        cmd += ["--entrypoint", "vllm", self.vllm.image]
+        return cmd + self.serve_args()
+
+    def serve_args(self) -> list[str]:
+        """`serve <model> ...`: the vLLM arguments, without the executable."""
+        cmd = ["serve", self.model]
         cmd += ["--host", self.host, "--port", str(self.port)]
         for key, value in self.vllm.args.items():
             if key in ("host", "port"):

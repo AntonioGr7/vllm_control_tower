@@ -62,6 +62,7 @@ models:
     port: 8000
     vllm:
       executable: vllm
+      # image: vllm/vllm-openai:latest   # run `vllm serve` in this Docker image instead
       args:                    # any `vllm serve` option, with or without leading dashes
         gpu-memory-utilization: 0.8
         max-model-len: 4096
@@ -100,9 +101,38 @@ models:
 
 ![Deployment estimate: a chat model and an embedding model sharing one GPU, with the combined VRAM budget per model](docs/tui-group.png)
 
-### Unified memory (DGX Spark)
+### Docker images
 
-On GPUs without dedicated VRAM, such as the DGX Spark's GB10, NVML does not report memory, so `vct` budgets against system RAM from `/proc/meminfo`. The page cache counts as free. `gpu-memory-utilization` is then a share of memory the OS also uses, so leave headroom. [configs/spark-chat-embed.yaml](configs/spark-chat-embed.yaml) is a starting point. Estimate it from any machine with `vct estimate spark-chat-embed --gpu GB10`.
+Set `vllm.image` and the model runs from that image instead of a local vLLM. Everything else in the file stays the same: `args`, `flags`, `env` and the port mean what they mean for a local process, and the TUI, logs, monitor and benchmark work unchanged.
+
+```yaml
+    vllm:
+      image: vllm/vllm-openai:qwen38    # or an NGC image such as nvcr.io/nvidia/vllm:26.05-py3
+      args: {gpu-memory-utilization: 0.7, max-model-len: 32768}
+      docker:                           # optional
+        hf_cache: /data/huggingface     # default: $HF_HOME or ~/.cache/huggingface
+        args: [--shm-size, 16g]         # extra `docker run` options, verbatim
+```
+
+`vct` runs `docker run --rm --init --name vct-<deployment>.<model> --gpus all --ipc host --network host`. Host networking keeps `host:` and `port:` working as for a local process. It also:
+
+- mounts the Hugging Face cache, so the container reuses your downloads and the estimator reads the same files. A `model:` that is an absolute local path is mounted read-only at the same path;
+- passes each `env:` variable by name only (`-e HF_TOKEN`), so values never appear in the command line or the log;
+- forces the entrypoint to `vllm`, so NGC images and `vllm/vllm-openai` images work alike;
+- on `vct stop`, runs `docker stop` on the container. On `vct start`, it removes a leftover container with the same name, e.g. one whose `docker run` was killed.
+
+Docker needs the NVIDIA Container Toolkit, and your user must be in the `docker` group. Pull the image first (`docker pull <image>`): the first `vct start` would otherwise pull it as part of startup, and multi-GB images can exceed the 15-minute health wait. The container runs as root, so files it adds to the Hugging Face cache are owned by root.
+
+### DGX Spark
+
+[NVIDIA's guide](https://build.nvidia.com/spark/vllm/instructions) serves vLLM from containers. Both ways work with `vct`:
+
+- **Local vLLM:** `uv sync --extra vllm` installs aarch64 wheels with CUDA, and vLLM supports the GB10 (`sm_121`) natively. Check with `uv run python -c "import torch; print(torch.cuda.get_device_capability())"`, which should print `(12, 1)`. [configs/spark-chat-embed.yaml](configs/spark-chat-embed.yaml) uses this.
+- **NVIDIA's images:** set `vllm.image` to the image NVIDIA lists for the model. New models and NVFP4 checkpoints often run there before a vLLM release supports them. [configs/spark-qwen38.yaml](configs/spark-qwen38.yaml) uses this.
+
+One-time setup on the Spark: `docker ps` must work without `sudo` (`sudo usermod -aG docker $USER && newgrp docker`), and gated models need `HF_TOKEN` exported or `hf auth login`.
+
+The GB10 has no dedicated VRAM, and NVML does not report memory for it, so `vct` budgets against system RAM from `/proc/meminfo`. Page cache counts as free memory, the same way vLLM's own startup check counts it on integrated GPUs. `gpu-memory-utilization` is then a share of memory the OS also uses, so keep the models' sum well below 1. Estimate a Spark deployment from any machine with `vct estimate spark-chat-embed --gpu GB10`.
 
 Runtime state lives in `.vct/`: PID files, per-server logs (the previous run is kept as `.log.prev`), and cached model metadata. Override the locations with `VCT_CONFIG_DIR` and `VCT_RUNTIME_DIR`.
 

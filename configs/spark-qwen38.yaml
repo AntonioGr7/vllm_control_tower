@@ -1,0 +1,29 @@
+# NVIDIA's recommended DGX Spark model, from NVIDIA's own vLLM image
+# (https://build.nvidia.com/spark/vllm/instructions).
+#
+# The image carries a vLLM build tested for this model on the GB10; `vct` runs it with
+# Docker, mounting your Hugging Face cache, so the commands are the usual ones. Pull the
+# image once first: an implicit pull of several GB would count against the startup wait.
+#
+#   docker pull vllm/vllm-openai:qwen38
+#   hf download nvidia/Qwen3.8-27B-NVFP4      # optional: vLLM downloads it otherwise
+#   vct start spark-qwen38                    # OpenAI API on :8030
+name: spark-qwen38
+description: Qwen3.8 27B NVFP4 in NVIDIA's vLLM image on a DGX Spark
+host: 127.0.0.1
+env:
+  HF_TOKEN: ${HF_TOKEN}
+models:
+  - name: chat
+    model: nvidia/Qwen3.8-27B-NVFP4
+    port: 8030
+    vllm:
+      image: vllm/vllm-openai:qwen38
+      args:
+        gpu-memory-utilization: 0.7   # a share of the 128 GB the OS also uses
+        max-model-len: 32768
+        max-num-seqs: 16
+        enable-prefix-caching: true
+    estimate:
+      avg_prompt_tokens: 2048
+      avg_output_tokens: 512

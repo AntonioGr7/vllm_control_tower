@@ -165,7 +165,11 @@ def _read_gpu(nv, i: int) -> GpuSpec:
 
 
 def _system_memory() -> tuple[int, int]:
-    """(total, used) system RAM from /proc/meminfo; page cache counts as free."""
+    """(total, used) system RAM from /proc/meminfo; page cache counts as free.
+
+    Matches vLLM's startup check on integrated GPUs, which reads free memory from
+    psutil.virtual_memory().available, i.e. MemAvailable (vllm-project/vllm#35356).
+    """
     info: dict[str, int] = {}
     with open("/proc/meminfo") as f:
         for line in f:

@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 FAKE_VLLM = Path(__file__).parent / "fake_vllm.py"
+FAKE_DOCKER = Path(__file__).parent / "fake_docker.py"
 
 QWEN3_06B = {
     "architectures": ["Qwen3ForCausalLM"],
@@ -49,5 +50,16 @@ def fake_vllm_cmd(tmp_path) -> str:
     """An executable wrapper so the config's `executable` points at the fake server."""
     wrapper = tmp_path / "vllm"
     wrapper.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE_VLLM} "$@"\n')
+    wrapper.chmod(0o755)
+    return str(wrapper)
+
+
+@pytest.fixture
+def fake_docker_cmd(tmp_path, monkeypatch) -> str:
+    """A `docker` stand-in that runs the fake server as the "container"; its state dir
+    (PID files, calls.jsonl) is next to it."""
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(tmp_path / "docker"))
+    wrapper = tmp_path / "docker-cli"
+    wrapper.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE_DOCKER} "$@"\n')
     wrapper.chmod(0o755)
     return str(wrapper)

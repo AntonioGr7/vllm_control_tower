@@ -1,4 +1,5 @@
 import contextlib
+import json
 import time
 
 from vllm_control_tower.config import load_file
@@ -72,6 +73,66 @@ def test_stale_pid_file_is_detected_and_cleared(write_config, fake_vllm_cmd, fre
     pm.start(cfg)
     pm.wait_healthy(cfg.name, timeout=15, poll=0.2)
     assert pm.stop(cfg.name, timeout=5)
+
+
+def _docker_calls(tmp_path) -> list[list[str]]:
+    lines = (tmp_path / "docker" / "calls.jsonl").read_text().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def _docker_cfg(write_config, fake_docker_cmd, port, tmp_path):
+    path = write_config(
+        "boxed",
+        {
+            "env": {"HF_TOKEN": "t"},
+            "models": [
+                {
+                    "model": "fake/model",
+                    "port": port,
+                    "vllm": {
+                        "image": "vllm/vllm-openai:test",
+                        "docker": {"executable": fake_docker_cmd, "hf_cache": str(tmp_path / "hf")},
+                    },
+                }
+            ],
+        },
+    )
+    return load_file(path).members[0]
+
+
+def test_docker_start_health_stop(write_config, fake_docker_cmd, free_port, tmp_path):
+    cfg = _docker_cfg(write_config, fake_docker_cmd, free_port, tmp_path)
+    pm = ProcessManager(tmp_path / "rt")
+    rec = pm.start(cfg)
+    try:
+        assert rec.container == "vct-boxed.main"
+        assert pm.read_record(cfg.name).container == "vct-boxed.main"
+        assert (tmp_path / "hf").is_dir()  # created by us, not by docker as root
+        assert pm.wait_healthy(cfg.name, timeout=15, poll=0.2).state is State.RUNNING
+    finally:
+        assert pm.stop(cfg.name, timeout=5)
+    calls = _docker_calls(tmp_path)
+    assert calls[0] == ["rm", "-f", "vct-boxed.main"]  # a leftover container is cleared
+    assert calls[1][0] == "run"
+    assert calls[2] == ["stop", "-t", "5", "vct-boxed.main"]
+    assert pm.status(cfg.name).state is State.STOPPED
+
+
+def test_docker_orphan_container_is_removed_on_start(
+    write_config, fake_docker_cmd, free_port, tmp_path
+):
+    """`docker run` died but its container kept serving: the next start clears it."""
+    cfg = _docker_cfg(write_config, fake_docker_cmd, free_port, tmp_path)
+    pm = ProcessManager(tmp_path / "rt")
+    pm.start(cfg)
+    pm.wait_healthy(cfg.name, timeout=15, poll=0.2)
+    pm.pid_file(cfg.name).unlink()  # vct lost track of it; the port is still held
+    rec = pm.start(cfg)  # would fail with "port in use" if the orphan survived
+    try:
+        assert pm.wait_healthy(cfg.name, timeout=15, poll=0.2).state is State.RUNNING
+        assert rec.pid > 0
+    finally:
+        pm.stop(cfg.name, timeout=5)
 
 
 def test_refuses_double_start_and_busy_port(write_config, fake_vllm_cmd, free_port, tmp_path):

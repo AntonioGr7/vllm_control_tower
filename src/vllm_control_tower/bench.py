@@ -92,7 +92,8 @@ Progress = Callable[[str], None]
 
 def config_hash(cfg: ServeConfig) -> str:
     """Identifies the exact vLLM command a benchmark was taken with."""
-    cmd = cfg.command()[1:]  # the executable path may differ between machines
+    # Not the executable or the docker mounts: those paths differ between machines.
+    cmd = ([cfg.vllm.image] if cfg.vllm.image else []) + cfg.serve_args()
     return hashlib.sha1(json.dumps([cmd, cfg.resolved_env()]).encode()).hexdigest()[:12]
 
 

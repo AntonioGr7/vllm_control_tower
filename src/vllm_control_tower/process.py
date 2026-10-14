@@ -38,6 +38,7 @@ class ProcessRecord:
     command: list[str]
     started_at: float
     log_file: str
+    container: str | None = None  # docker container name; command[0] is the docker CLI
 
 
 @dataclass
@@ -99,6 +100,12 @@ class ProcessManager:
             self.pid_file(cfg.name).unlink(missing_ok=True)
         elif current.state is not State.STOPPED:
             raise RuntimeError(f"{cfg.name} is already running (pid {current.record.pid})")
+        cmd = cfg.command()
+        if cfg.container:
+            # A container outlives a killed `docker run`; this name is ours, so clear it.
+            _docker(cmd[0], "rm", "-f", cfg.container)
+            # Created by docker (as root) otherwise, which the estimator can't write to.
+            cfg.hf_cache().mkdir(parents=True, exist_ok=True)
         for other in self.running():
             if other.record and other.record.port == cfg.port:
                 raise RuntimeError(f"port {cfg.port} is already used by {other.name}")
@@ -111,7 +118,6 @@ class ProcessManager:
         if log.exists():
             log.replace(log.with_suffix(".log.prev"))
 
-        cmd = cfg.command()
         env = {**os.environ, **cfg.resolved_env()}
         env.setdefault("PYTHONUNBUFFERED", "1")
         with log.open("ab") as fh:
@@ -127,9 +133,12 @@ class ProcessManager:
                     start_new_session=True,  # own process group, survives the TUI exiting
                 )
             except FileNotFoundError as e:
-                raise RuntimeError(
-                    f"cannot run {cmd[0]!r}: install vLLM (uv sync --extra vllm) or set vllm.executable"
-                ) from e
+                hint = (
+                    "install Docker and the NVIDIA Container Toolkit, or set vllm.docker.executable"
+                    if cfg.container
+                    else "install vLLM (uv sync --extra vllm) or set vllm.executable"
+                )
+                raise RuntimeError(f"cannot run {cmd[0]!r}: {hint}") from e
 
         rec = ProcessRecord(
             name=cfg.name,
@@ -141,17 +150,25 @@ class ProcessManager:
             command=cmd,
             started_at=time.time(),
             log_file=str(log),
+            container=cfg.container,
         )
         self.pid_file(cfg.name).write_text(json.dumps(asdict(rec), indent=2))
         return rec
 
     def stop(self, name: str, timeout: float = 30.0) -> bool:
-        """SIGTERM the process group, escalate to SIGKILL after `timeout`. Returns True if it was running."""
+        """`docker stop` its container, if any, then SIGTERM the process group and escalate
+        to SIGKILL after `timeout`. Returns True if it was running."""
         rec = self.read_record(name)
         if rec is None:
             return False
         was_running = _alive(rec.pid)
-        if was_running:
+        if rec.container:
+            # Signals to `docker run` don't reliably reach the container, and a SIGKILL
+            # would orphan it with the port and the memory: stop the container itself.
+            stopped = _docker(rec.command[0], "stop", "-t", str(int(timeout)), rec.container,
+                              timeout=timeout + 15)  # fmt: skip
+            was_running = was_running or stopped
+        if _alive(rec.pid):
             _signal_group(rec.pgid, signal.SIGTERM)
             deadline = time.time() + timeout
             while time.time() < deadline and _group_alive(rec.pgid):
@@ -186,6 +203,19 @@ def health(base_url: str, timeout: float = 1.5) -> bool:
     try:
         return httpx.get(f"{base_url}/health", timeout=timeout).status_code == 200
     except httpx.HTTPError:
+        return False
+
+
+def _docker(executable: str, *args: str, timeout: float = 30.0) -> bool:
+    """Run a docker CLI command quietly; True if it succeeded."""
+    try:
+        return (
+            subprocess.run(
+                [executable, *args], capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
